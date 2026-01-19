@@ -1,11 +1,18 @@
 require("dotenv").config();
 const { Client, GatewayIntentBits, PermissionFlagsBits, Events } = require("discord.js");
-const { Client: PgClient } = require("pg");
+const { Pool } = require("pg");
 
 const ROLES = {
   UNLINKED: "1462833260567597272",     
   ACTIVE_MEMBER: "1462832923970633768" 
 };
+
+// Configured with a 5-second timeout to prevent hanging
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  connectionTimeoutMillis: 5000, 
+  ssl: { rejectUnauthorized: false },
+});
 
 const client = new Client({
   intents: [
@@ -16,23 +23,21 @@ const client = new Client({
   ],
 });
 
-/* -------------------- 1. CHUNKED SYNC LOGIC -------------------- */
 async function runRoleSync(channel) {
-  console.log("🛠️ Starting Chunked Sync...");
+  console.log("🛠️ CHECKPOINT 1: Function Started.");
   const guild = client.guilds.cache.get(process.env.DISCORD_GUILD_ID);
-  if (!guild) return;
-
-  const db = new PgClient({
-    connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false },
-  });
+  if (!guild) return console.log("❌ Error: Guild not found.");
 
   try {
-    await db.connect();
-    const { rows } = await db.query("SELECT discord_id, subscription_status FROM users");
-    await db.end();
+    console.log("🛠️ CHECKPOINT 2: Attempting DB Query...");
+    if (channel) await channel.send("🛰️ Connecting to database...");
+
+    // Testing the query directly
+    const res = await pool.query("SELECT discord_id, subscription_status FROM users");
+    const rows = res.rows;
     
-    if (channel) await channel.send(`🔍 Found ${rows.length} records. Syncing in chunks...`);
+    console.log(`🛠️ CHECKPOINT 3: DB Success! Found ${rows.length} rows.`);
+    if (channel) await channel.send(`✅ Found ${rows.length} records. Syncing...`);
 
     let successCount = 0;
     for (let i = 0; i < rows.length; i++) {
@@ -60,26 +65,19 @@ async function runRoleSync(channel) {
           }
         }
       } catch (e) {
-        console.log(`❌ Error on ${row.discord_id}: ${e.message}`);
+        console.log(`❌ Member Error (${row.discord_id}): ${e.message}`);
       }
 
-      // Every 10 users, take a longer 5-second break to satisfy Railway's health monitor
-      if (i > 0 && i % 10 === 0) {
-        console.log("☕ Taking a 5s breather for Railway health checks...");
-        await new Promise(r => setTimeout(r, 5000));
-      } else {
-        await new Promise(r => setTimeout(r, 2000));
-      }
+      // 2-second delay per user
+      await new Promise(r => setTimeout(r, 2000));
     }
-    if (channel) await channel.send(`🏁 Sync complete! Updated ${successCount} users.`);
+    if (channel) await channel.send(`🏁 Finished! Updated ${successCount} users.`);
   } catch (err) {
-    console.error("❌ SYNC FAILED:", err);
-    if (db) await db.end().catch(() => {});
+    console.error("❌ DATABASE CRITICAL ERROR:", err.message);
+    if (channel) await channel.send(`❌ Database Error: ${err.message}`);
   }
 }
 
-/* -------------------- 2. STABLE EVENTS -------------------- */
-// Using clientReady to stop the DeprecationWarning
 client.once(Events.ClientReady, (c) => {
   console.log(`🚀 Bot is Online: ${c.user.tag}`);
 });
@@ -87,24 +85,6 @@ client.once(Events.ClientReady, (c) => {
 client.on("messageCreate", async (message) => {
   if (message.content === "!sync" && message.member?.permissions.has(PermissionFlagsBits.Administrator)) {
     runRoleSync(message.channel);
-  }
-});
-
-client.on("interactionCreate", async (interaction) => {
-  if (!interaction.isChatInputCommand()) return;
-  if (interaction.commandName === "link") {
-    try {
-      const response = await fetch(`${process.env.PUBLIC_BACKEND_URL}/link/start`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ discordId: interaction.user.id }),
-      });
-      const data = await response.json();
-      // Use flags to replace deprecated ephemeral
-      await interaction.reply({ content: `🔗 [Click here to verify](${data.url})`, flags: [64] });
-    } catch (err) {
-      await interaction.reply({ content: "❌ Backend connection error.", flags: [64] });
-    }
   }
 });
 
