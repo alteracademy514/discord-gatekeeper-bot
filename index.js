@@ -14,6 +14,7 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
+// --- CONFIGURATION ---
 const ROLES = {
   UNLINKED: "1330559779389276274",     
   ACTIVE_MEMBER: "1330559648937902161" 
@@ -36,7 +37,7 @@ async function runRoleSync() {
   if (!guild) return;
 
   try {
-    // We only fetch when MANUALLY triggered now to avoid Opcode 8 errors on boot
+    // FETCH: Downloads the 169+ members you have
     console.log("📥 Fetching full member list...");
     const allMembers = await guild.members.fetch({ force: true }); 
     console.log(`✅ SUCCESS: Bot sees ${allMembers.size} total members.`);
@@ -63,9 +64,11 @@ async function runRoleSync() {
             console.log(`[${processed}] ⚠️ ${member.user.tag}: UNLINKED`);
           }
         }
-      } catch (err) { /* Skip protected users */ }
+      } catch (err) {
+        // Skip admins/staff if bot lacks permission on them
+      }
 
-      // Wait 500ms between role changes to be safe
+      // Safety Throttle: 500ms between role changes
       await new Promise(r => setTimeout(r, 500));
     }
     console.log("🏁 DEEP SCAN FINISHED.");
@@ -96,10 +99,9 @@ async function checkDeadlinesAndKick() {
 }
 
 /* -------------------- 3. EVENTS -------------------- */
-// Updated to 'ready' to satisfy current d.js versions while avoiding deprecation noise
 client.on("ready", () => {
   console.log(`🚀 Logged in as ${client.user.tag}`);
-  // WE REMOVED runRoleSync() FROM HERE TO PREVENT BOOT CRASHES
+  // SYNC is NOT on boot to avoid Gateway Ban (Opcode 8)
   setInterval(checkDeadlinesAndKick, 10 * 60 * 1000); 
 });
 
@@ -114,15 +116,20 @@ client.on("interactionCreate", async (interaction) => {
         body: JSON.stringify({ discordId: interaction.user.id }),
       });
       const data = await response.json();
-      await interaction.reply({ content: `🔗 [Click here to verify](${data.url})`, ephemeral: true });
+      await interaction.reply({ content: `🔗 [Click here to verify subscription](${data.url})`, ephemeral: true });
     } catch (err) {
       await interaction.reply({ content: "❌ Backend connection error.", ephemeral: true });
     }
   }
 
   if (interaction.commandName === "check") {
-    await interaction.reply("👮 Deep sync triggered. Watch Railway logs...");
-    runRoleSync();
+    // FIX: Tells Discord to wait so it doesn't crash after 3 seconds
+    await interaction.deferReply({ ephemeral: true }); 
+    console.log("👮 Deep sync triggered...");
+    
+    await runRoleSync(); 
+    
+    await interaction.editReply("🏁 Deep sync complete! All members processed.");
   }
 });
 
