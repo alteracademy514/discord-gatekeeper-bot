@@ -11,8 +11,8 @@ const pool = new Pool({
  * Right-click the role and select "Copy Role ID".
  */
 const ROLES = {
-  UNLINKED: "1330559779389276274",     
-  ACTIVE_MEMBER: "1330559648937902161" 
+  UNLINKED: "1462833260567597272",     
+  ACTIVE_MEMBER: "1462832923970633768" 
 };
 
 const client = new Client({
