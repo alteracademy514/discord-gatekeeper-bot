@@ -1,9 +1,5 @@
 require("dotenv").config();
-const { 
-  Client, 
-  GatewayIntentBits, 
-  PermissionFlagsBits 
-} = require("discord.js");
+const { Client, GatewayIntentBits, PermissionFlagsBits } = require("discord.js");
 const { Pool } = require("pg");
 
 const pool = new Pool({
@@ -25,73 +21,83 @@ const client = new Client({
   ],
 });
 
-/* -------------------- 1. ULTRA-LIGHT SYNC -------------------- */
+/* -------------------- 1. STEP-BY-STEP DEBUG SYNC -------------------- */
 async function runRoleSync(channel) {
-  console.log("👮 STARTING SYNC...");
+  console.log("🛠️ DEBUG: runRoleSync function triggered.");
   const guild = client.guilds.cache.get(process.env.DISCORD_GUILD_ID);
-  if (!guild) return;
+  
+  if (!guild) {
+    console.log("❌ DEBUG: Guild not found! Check DISCORD_GUILD_ID.");
+    return;
+  }
 
   try {
-    if (channel) await channel.send("⏳ Syncing... checking members one-by-one (3s delay).");
+    if (channel) await channel.send("🔍 Debug: Querying Database...");
+    console.log("🛠️ DEBUG: Querying Postgres...");
     
-    // Fetch IDs only
     const { rows } = await pool.query("SELECT discord_id, subscription_status FROM users");
-    
+    console.log(`🛠️ DEBUG: Database returned ${rows.length} rows.`);
+
+    if (channel) await channel.send(`🔍 Debug: Found ${rows.length} records. Starting loop...`);
+
     let successCount = 0;
-    for (const row of rows) {
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      console.log(`🛠️ DEBUG: [${i+1}/${rows.length}] Checking ID: ${row.discord_id}`);
+
       try {
-        // Fetch specific member only when needed to save memory
+        // Fetch specific member only to save memory
         const member = await guild.members.fetch(row.discord_id).catch(() => null);
-        if (!member || member.id === guild.ownerId) continue;
+        
+        if (!member) {
+          console.log(`🛠️ DEBUG: Member ${row.discord_id} not in server. Skipping.`);
+          continue;
+        }
+
+        if (member.id === guild.ownerId) {
+          console.log(`🛠️ DEBUG: Skipping owner.`);
+          continue;
+        }
 
         if (row.subscription_status === 'active') {
           if (!member.roles.cache.has(ROLES.ACTIVE_MEMBER)) {
             await member.roles.add(ROLES.ACTIVE_MEMBER);
             await member.roles.remove(ROLES.UNLINKED);
             successCount++;
-            console.log(`✅ [${successCount}] Updated: ${member.user.tag}`);
+            console.log(`✅ [SYNC] ${member.user.tag} -> ACTIVE`);
           }
         } else {
           if (!member.roles.cache.has(ROLES.UNLINKED)) {
             await member.roles.add(ROLES.UNLINKED);
             await member.roles.remove(ROLES.ACTIVE_MEMBER);
             successCount++;
-            console.log(`⚠️ [${successCount}] Unlinked: ${member.user.tag}`);
+            console.log(`⚠️ [SYNC] ${member.user.tag} -> UNLINKED`);
           }
         }
-      } catch (e) {}
-      // Increased to 3-second delay to keep Railway CPU flat
+      } catch (e) {
+        console.log(`❌ DEBUG: Error processing ${row.discord_id}: ${e.message}`);
+      }
+
+      // 3-second delay to keep Railway stable
       await new Promise(r => setTimeout(r, 3000));
     }
-    if (channel) await channel.send(`🏁 Done! Updated ${successCount} users.`);
+    
+    if (channel) await channel.send(`🏁 Debug Sync Finished. Total updated: ${successCount}`);
+    console.log("🏁 DEBUG SYNC COMPLETE.");
   } catch (err) {
-    console.error("❌ SYNC ERROR:", err);
+    console.error("❌ DEBUG CRITICAL ERROR:", err);
+    if (channel) await channel.send(`❌ Critical Error: ${err.message}`);
   }
 }
 
 /* -------------------- 2. MINIMAL EVENTS -------------------- */
 client.on("ready", () => {
-  console.log(`🚀 Bot is Online: ${client.user.tag}`);
+  console.log(`🚀 Bot Online: ${client.user.tag}`);
 });
 
 client.on("messageCreate", async (message) => {
-  // Use !sync to start
   if (message.content === "!sync" && message.member?.permissions.has(PermissionFlagsBits.Administrator)) {
     runRoleSync(message.channel);
-  }
-});
-
-// Handling slash commands manually to save memory
-client.on("interactionCreate", async (interaction) => {
-  if (!interaction.isChatInputCommand()) return;
-  if (interaction.commandName === "link") {
-    const response = await fetch(`${process.env.PUBLIC_BACKEND_URL}/link/start`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ discordId: interaction.user.id }),
-    });
-    const data = await response.json();
-    await interaction.reply({ content: `🔗 [Verify Here](${data.url})`, ephemeral: true });
   }
 });
 
