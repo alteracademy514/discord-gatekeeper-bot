@@ -7,10 +7,8 @@ const ROLES = {
   ACTIVE_MEMBER: "1462832923970633768" 
 };
 
-// Configured with a 5-second timeout to prevent hanging
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  connectionTimeoutMillis: 5000, 
   ssl: { rejectUnauthorized: false },
 });
 
@@ -23,21 +21,11 @@ const client = new Client({
   ],
 });
 
-async function runRoleSync(channel) {
-  console.log("🛠️ CHECKPOINT 1: Function Started.");
-  const guild = client.guilds.cache.get(process.env.DISCORD_GUILD_ID);
-  if (!guild) return console.log("❌ Error: Guild not found.");
-
+// THIS IS THE BACKGROUND WORKER
+async function backgroundSync(guild, channel) {
   try {
-    console.log("🛠️ CHECKPOINT 2: Attempting DB Query...");
-    if (channel) await channel.send("🛰️ Connecting to database...");
-
-    // Testing the query directly
-    const res = await pool.query("SELECT discord_id, subscription_status FROM users");
-    const rows = res.rows;
-    
-    console.log(`🛠️ CHECKPOINT 3: DB Success! Found ${rows.length} rows.`);
-    if (channel) await channel.send(`✅ Found ${rows.length} records. Syncing...`);
+    const { rows } = await pool.query("SELECT discord_id, subscription_status FROM users");
+    console.log(`📊 Background Sync: Processing ${rows.length} users.`);
 
     let successCount = 0;
     for (let i = 0; i < rows.length; i++) {
@@ -64,17 +52,14 @@ async function runRoleSync(channel) {
             console.log(`⚠️ [${i+1}] Unlinked: ${member.user.tag}`);
           }
         }
-      } catch (e) {
-        console.log(`❌ Member Error (${row.discord_id}): ${e.message}`);
-      }
+      } catch (e) { console.log(`❌ ${row.discord_id}: ${e.message}`); }
 
-      // 2-second delay per user
-      await new Promise(r => setTimeout(r, 2000));
+      // 1-second delay is enough if we aren't blocking the main thread
+      await new Promise(r => setTimeout(r, 1000));
     }
-    if (channel) await channel.send(`🏁 Finished! Updated ${successCount} users.`);
+    if (channel) channel.send(`🏁 **Sync Complete!** Updated ${successCount} members.`);
   } catch (err) {
-    console.error("❌ DATABASE CRITICAL ERROR:", err.message);
-    if (channel) await channel.send(`❌ Database Error: ${err.message}`);
+    console.error("❌ Background Sync Error:", err);
   }
 }
 
@@ -84,7 +69,12 @@ client.once(Events.ClientReady, (c) => {
 
 client.on("messageCreate", async (message) => {
   if (message.content === "!sync" && message.member?.permissions.has(PermissionFlagsBits.Administrator)) {
-    runRoleSync(message.channel);
+    const guild = message.guild;
+    message.reply("🚀 **Deep Sync Started.** I'll notify you here when finished. Watch Railway logs for live updates!");
+    
+    // Trigger the function BUT DON'T 'AWAIT' IT
+    // This lets the bot keep "breathing" so Railway doesn't kill it
+    backgroundSync(guild, message.channel);
   }
 });
 
