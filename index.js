@@ -2,9 +2,6 @@ require("dotenv").config();
 const { 
   Client, 
   GatewayIntentBits, 
-  REST, 
-  Routes, 
-  SlashCommandBuilder, 
   PermissionFlagsBits 
 } = require("discord.js");
 const { Pool } = require("pg");
@@ -30,20 +27,20 @@ const client = new Client({
 
 /* -------------------- 1. ULTRA-LIGHT SYNC -------------------- */
 async function runRoleSync(channel) {
-  console.log("👮 STARTING ULTRA-LIGHT SYNC...");
+  console.log("👮 STARTING SYNC...");
   const guild = client.guilds.cache.get(process.env.DISCORD_GUILD_ID);
   if (!guild) return;
 
   try {
-    if (channel) await channel.send("⏳ Processing 169 members slowly (2s delay each) to prevent Railway crashes...");
+    if (channel) await channel.send("⏳ Syncing... checking members one-by-one (3s delay).");
     
+    // Fetch IDs only
     const { rows } = await pool.query("SELECT discord_id, subscription_status FROM users");
-    console.log(`📊 Found ${rows.length} records.`);
-
+    
     let successCount = 0;
     for (const row of rows) {
       try {
-        // Fetch specific member only to save memory
+        // Fetch specific member only when needed to save memory
         const member = await guild.members.fetch(row.discord_id).catch(() => null);
         if (!member || member.id === guild.ownerId) continue;
 
@@ -63,55 +60,38 @@ async function runRoleSync(channel) {
           }
         }
       } catch (e) {}
-      // 2-second delay protects Railway container from SIGTERM
-      await new Promise(r => setTimeout(r, 2000));
+      // Increased to 3-second delay to keep Railway CPU flat
+      await new Promise(r => setTimeout(r, 3000));
     }
-    if (channel) await channel.send(`🏁 Finished! Updated ${successCount} users.`);
+    if (channel) await channel.send(`🏁 Done! Updated ${successCount} users.`);
   } catch (err) {
     console.error("❌ SYNC ERROR:", err);
   }
 }
 
-/* -------------------- 2. STAGGERED STARTUP -------------------- */
-client.on("ready", async () => {
-  console.log(`🚀 Logged in as ${client.user.tag}`);
-  
-  // WAIT 5 SECONDS before registering commands to prevent CPU spike
-  await new Promise(r => setTimeout(r, 5000));
-  
-  const commands = [new SlashCommandBuilder().setName("link").setDescription("Link subscription")].map(c => c.toJSON());
-  const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
-  
-  try {
-    await rest.put(Routes.applicationGuildCommands(process.env.DISCORD_CLIENT_ID, process.env.DISCORD_GUILD_ID), { body: commands });
-    console.log("✅ Commands registered after delay.");
-  } catch (e) {
-    console.error("❌ Command registration failed:", e);
-  }
+/* -------------------- 2. MINIMAL EVENTS -------------------- */
+client.on("ready", () => {
+  console.log(`🚀 Bot is Online: ${client.user.tag}`);
 });
 
-/* -------------------- 3. COMMAND TRIGGERS -------------------- */
 client.on("messageCreate", async (message) => {
-  // Use !sync to start the process safely
+  // Use !sync to start
   if (message.content === "!sync" && message.member?.permissions.has(PermissionFlagsBits.Administrator)) {
     runRoleSync(message.channel);
   }
 });
 
+// Handling slash commands manually to save memory
 client.on("interactionCreate", async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
   if (interaction.commandName === "link") {
-    try {
-      const response = await fetch(`${process.env.PUBLIC_BACKEND_URL}/link/start`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ discordId: interaction.user.id }),
-      });
-      const data = await response.json();
-      await interaction.reply({ content: `🔗 [Verify Here](${data.url})`, ephemeral: true });
-    } catch (err) {
-      await interaction.reply({ content: "❌ Backend error.", ephemeral: true });
-    }
+    const response = await fetch(`${process.env.PUBLIC_BACKEND_URL}/link/start`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ discordId: interaction.user.id }),
+    });
+    const data = await response.json();
+    await interaction.reply({ content: `🔗 [Verify Here](${data.url})`, ephemeral: true });
   }
 });
 
