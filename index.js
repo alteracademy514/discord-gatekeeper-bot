@@ -14,7 +14,6 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-// --- CONFIGURATION ---
 const ROLES = {
   UNLINKED: "1330559779389276274",     
   ACTIVE_MEMBER: "1330559648937902161" 
@@ -34,28 +33,20 @@ async function runRoleSync() {
   console.log("👮 DEEP SCAN INITIATED...");
   
   const guild = client.guilds.cache.get(process.env.DISCORD_GUILD_ID);
-  if (!guild) {
-    console.error("❌ CRITICAL: Guild not found.");
-    return;
-  }
+  if (!guild) return;
 
   try {
-    // FIX: Slower fetch to prevent "GatewayRateLimitError" (Opcode 8)
-    console.log("📥 Fetching members slowly from Discord Gateway...");
-    const allMembers = await guild.members.fetch({ force: true, time: 60000 }); 
+    // We only fetch when MANUALLY triggered now to avoid Opcode 8 errors on boot
+    console.log("📥 Fetching full member list...");
+    const allMembers = await guild.members.fetch({ force: true }); 
     console.log(`✅ SUCCESS: Bot sees ${allMembers.size} total members.`);
 
     const dbUsers = await pool.query("SELECT discord_id, subscription_status FROM users");
-    console.log(`📊 Processing ${dbUsers.rows.length} database records...`);
-
+    
     let processed = 0;
     for (const row of dbUsers.rows) {
       const member = allMembers.get(row.discord_id);
-      
-      if (!member) continue;
-      
-      // Skip the Server Owner as bots cannot modify them regardless of role position
-      if (member.id === guild.ownerId) continue;
+      if (!member || member.id === guild.ownerId) continue;
 
       processed++;
       try {
@@ -72,17 +63,12 @@ async function runRoleSync() {
             console.log(`[${processed}] ⚠️ ${member.user.tag}: UNLINKED`);
           }
         }
-      } catch (err) {
-        // This will now only trigger for protected users like Admins/Staff
-        // but the bot will KEEP RUNNING for everyone else.
-      }
+      } catch (err) { /* Skip protected users */ }
 
-      // INCREASED DELAY: 500ms prevents the "Missing Permissions" crash 
-      // and keeps the Gateway connection stable.
+      // Wait 500ms between role changes to be safe
       await new Promise(r => setTimeout(r, 500));
     }
     console.log("🏁 DEEP SCAN FINISHED.");
-    console.log("-----------------------------------------");
   } catch (err) {
     console.error("❌ SYNC FAILED:", err);
   }
@@ -106,13 +92,14 @@ async function checkDeadlinesAndKick() {
         }
       } catch (e) {}
     }
-  } catch (err) { console.error("Reaper Error:", err); }
+  } catch (err) { console.error(err); }
 }
 
-/* -------------------- 3. EVENTS & COMMANDS -------------------- */
-client.once("ready", () => {
+/* -------------------- 3. EVENTS -------------------- */
+// Updated to 'ready' to satisfy current d.js versions while avoiding deprecation noise
+client.on("ready", () => {
   console.log(`🚀 Logged in as ${client.user.tag}`);
-  runRoleSync();
+  // WE REMOVED runRoleSync() FROM HERE TO PREVENT BOOT CRASHES
   setInterval(checkDeadlinesAndKick, 10 * 60 * 1000); 
 });
 
@@ -139,6 +126,7 @@ client.on("interactionCreate", async (interaction) => {
   }
 });
 
+/* -------------------- 4. REGISTRATION -------------------- */
 const commands = [
   new SlashCommandBuilder().setName("link").setDescription("Link your Stripe subscription"),
   new SlashCommandBuilder().setName("check").setDescription("Admin: Force deep role sync").setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
