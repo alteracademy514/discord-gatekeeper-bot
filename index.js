@@ -28,47 +28,52 @@ const client = new Client({
   ],
 });
 
-/* -------------------- 1. STABLE SYNC LOGIC -------------------- */
+/* -------------------- 1. ULTRA-LIGHT SYNC -------------------- */
 async function runRoleSync(channel) {
-  console.log("👮 DEEP SCAN INITIATED...");
+  console.log("👮 STARTING ULTRA-LIGHT SYNC...");
   const guild = client.guilds.cache.get(process.env.DISCORD_GUILD_ID);
   if (!guild) return;
 
   try {
-    if (channel) await channel.send("📥 Syncing... processing 169 members slowly to prevent crashes.");
+    if (channel) await channel.send("⏳ Processing... moving slowly to avoid crashes.");
     
-    // We fetch members once and store them to avoid repeated API calls
-    const allMembers = await guild.members.fetch(); 
-    const dbUsers = await pool.query("SELECT discord_id, subscription_status FROM users");
+    // We only fetch the IDs from the database to keep memory low
+    const { rows } = await pool.query("SELECT discord_id, subscription_status FROM users");
+    console.log(`📊 Found ${rows.length} records to check.`);
 
-    let processed = 0;
-    for (const row of dbUsers.rows) {
-      const member = allMembers.get(row.discord_id);
-      if (!member || member.id === guild.ownerId) continue;
+    let successCount = 0;
 
-      processed++;
+    for (const row of rows) {
       try {
+        // Fetch the specific member only when needed
+        const member = await guild.members.fetch(row.discord_id).catch(() => null);
+        if (!member || member.id === guild.ownerId) continue;
+
         if (row.subscription_status === 'active') {
           if (!member.roles.cache.has(ROLES.ACTIVE_MEMBER)) {
             await member.roles.add(ROLES.ACTIVE_MEMBER);
             await member.roles.remove(ROLES.UNLINKED);
-            console.log(`[${processed}] ✅ ${member.user.tag}: ACTIVE`);
+            successCount++;
+            console.log(`✅ [${successCount}] Updated: ${member.user.tag}`);
           }
         } else {
           if (!member.roles.cache.has(ROLES.UNLINKED)) {
             await member.roles.add(ROLES.UNLINKED);
             await member.roles.remove(ROLES.ACTIVE_MEMBER);
-            console.log(`[${processed}] ⚠️ ${member.user.tag}: UNLINKED`);
+            successCount++;
+            console.log(`⚠️ [${successCount}] Unlinked: ${member.user.tag}`);
           }
         }
-      } catch (err) { /* Skip protected users */ }
+      } catch (e) {
+        // Ignore errors for individual users (like staff/admins)
+      }
 
-      // 1.5 second delay: This is the key to stopping the SIGTERM crashes
-      await new Promise(r => setTimeout(r, 1500));
+      // 2-second delay: This MUST be slow to prevent Railway from killing the bot
+      await new Promise(r => setTimeout(r, 2000));
     }
-    if (channel) await channel.send("🏁 Done! All members synced.");
+    if (channel) await channel.send(`🏁 Finished! Updated ${successCount} users.`);
   } catch (err) {
-    console.error("❌ SYNC FAILED:", err);
+    console.error("❌ CRITICAL SYNC ERROR:", err);
   }
 }
 
@@ -77,8 +82,8 @@ client.on("ready", () => {
   console.log(`🚀 Logged in as ${client.user.tag}`);
 });
 
-// Admin command trigger
 client.on("messageCreate", async (message) => {
+  // Use !sync to trigger
   if (message.content === "!sync" && message.member.permissions.has(PermissionFlagsBits.Administrator)) {
     runRoleSync(message.channel);
   }
@@ -94,24 +99,19 @@ client.on("interactionCreate", async (interaction) => {
         body: JSON.stringify({ discordId: interaction.user.id }),
       });
       const data = await response.json();
-      await interaction.reply({ content: `🔗 [Click here to verify](${data.url})`, ephemeral: true });
+      await interaction.reply({ content: `🔗 [Verify Here](${data.url})`, ephemeral: true });
     } catch (err) {
-      await interaction.reply({ content: "❌ Backend connection error.", ephemeral: true });
+      await interaction.reply({ content: "❌ Backend error.", ephemeral: true });
     }
   }
 });
 
-/* -------------------- 3. REGISTRATION -------------------- */
-const commands = [
-  new SlashCommandBuilder().setName("link").setDescription("Link your Stripe subscription"),
-].map(c => c.toJSON());
-
+const commands = [new SlashCommandBuilder().setName("link").setDescription("Link subscription")].map(c => c.toJSON());
 const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
 (async () => {
   try {
     await rest.put(Routes.applicationGuildCommands(process.env.DISCORD_CLIENT_ID, process.env.DISCORD_GUILD_ID), { body: commands });
-    console.log("✅ Commands registered.");
-  } catch (e) { console.error(e); }
+  } catch (e) {}
 })();
 
 client.login(process.env.DISCORD_TOKEN);
