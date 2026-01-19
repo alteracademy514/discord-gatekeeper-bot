@@ -35,17 +35,15 @@ async function runRoleSync(channel) {
   if (!guild) return;
 
   try {
-    if (channel) await channel.send("⏳ Processing... moving slowly to avoid crashes.");
+    if (channel) await channel.send("⏳ Processing 169 members slowly (2s delay each) to prevent Railway crashes...");
     
-    // We only fetch the IDs from the database to keep memory low
     const { rows } = await pool.query("SELECT discord_id, subscription_status FROM users");
-    console.log(`📊 Found ${rows.length} records to check.`);
+    console.log(`📊 Found ${rows.length} records.`);
 
     let successCount = 0;
-
     for (const row of rows) {
       try {
-        // Fetch the specific member only when needed
+        // Fetch specific member only to save memory
         const member = await guild.members.fetch(row.discord_id).catch(() => null);
         if (!member || member.id === guild.ownerId) continue;
 
@@ -64,27 +62,38 @@ async function runRoleSync(channel) {
             console.log(`⚠️ [${successCount}] Unlinked: ${member.user.tag}`);
           }
         }
-      } catch (e) {
-        // Ignore errors for individual users (like staff/admins)
-      }
-
-      // 2-second delay: This MUST be slow to prevent Railway from killing the bot
+      } catch (e) {}
+      // 2-second delay protects Railway container from SIGTERM
       await new Promise(r => setTimeout(r, 2000));
     }
     if (channel) await channel.send(`🏁 Finished! Updated ${successCount} users.`);
   } catch (err) {
-    console.error("❌ CRITICAL SYNC ERROR:", err);
+    console.error("❌ SYNC ERROR:", err);
   }
 }
 
-/* -------------------- 2. EVENTS -------------------- */
-client.on("ready", () => {
+/* -------------------- 2. STAGGERED STARTUP -------------------- */
+client.on("ready", async () => {
   console.log(`🚀 Logged in as ${client.user.tag}`);
+  
+  // WAIT 5 SECONDS before registering commands to prevent CPU spike
+  await new Promise(r => setTimeout(r, 5000));
+  
+  const commands = [new SlashCommandBuilder().setName("link").setDescription("Link subscription")].map(c => c.toJSON());
+  const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
+  
+  try {
+    await rest.put(Routes.applicationGuildCommands(process.env.DISCORD_CLIENT_ID, process.env.DISCORD_GUILD_ID), { body: commands });
+    console.log("✅ Commands registered after delay.");
+  } catch (e) {
+    console.error("❌ Command registration failed:", e);
+  }
 });
 
+/* -------------------- 3. COMMAND TRIGGERS -------------------- */
 client.on("messageCreate", async (message) => {
-  // Use !sync to trigger
-  if (message.content === "!sync" && message.member.permissions.has(PermissionFlagsBits.Administrator)) {
+  // Use !sync to start the process safely
+  if (message.content === "!sync" && message.member?.permissions.has(PermissionFlagsBits.Administrator)) {
     runRoleSync(message.channel);
   }
 });
@@ -105,13 +114,5 @@ client.on("interactionCreate", async (interaction) => {
     }
   }
 });
-
-const commands = [new SlashCommandBuilder().setName("link").setDescription("Link subscription")].map(c => c.toJSON());
-const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
-(async () => {
-  try {
-    await rest.put(Routes.applicationGuildCommands(process.env.DISCORD_CLIENT_ID, process.env.DISCORD_GUILD_ID), { body: commands });
-  } catch (e) {}
-})();
 
 client.login(process.env.DISCORD_TOKEN);
