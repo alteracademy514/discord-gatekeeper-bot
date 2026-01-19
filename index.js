@@ -14,6 +14,7 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
+// --- CONFIGURATION ---
 const ROLES = {
   UNLINKED: "1330559779389276274",     
   ACTIVE_MEMBER: "1330559648937902161" 
@@ -24,19 +25,22 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMembers, 
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent, // REQUIRED for !sync
+    GatewayIntentBits.MessageContent, // REQUIRED for the !sync trigger
   ],
 });
 
 /* -------------------- 1. DEEP SYNC LOGIC -------------------- */
 async function runRoleSync(channel) {
+  console.log("-----------------------------------------");
+  console.log("👮 DEEP SCAN INITIATED...");
+  
   const guild = client.guilds.cache.get(process.env.DISCORD_GUILD_ID);
   if (!guild) return;
 
   try {
     if (channel) await channel.send("📥 Starting Deep Scan... fetching members.");
     
-    // Downloads all 169+ members directly into memory
+    // Fetch members and wait to ensure the list is ready
     const allMembers = await guild.members.fetch(); 
     console.log(`✅ Success: Bot sees ${allMembers.size} members.`);
 
@@ -46,6 +50,7 @@ async function runRoleSync(channel) {
     let processed = 0;
     for (const row of dbUsers.rows) {
       const member = allMembers.get(row.discord_id);
+      
       if (!member || member.id === guild.ownerId) continue;
 
       processed++;
@@ -64,13 +69,15 @@ async function runRoleSync(channel) {
           }
         }
       } catch (err) {
-        // Skips admins/staff silently so the loop keeps running
+        // Skips protected users like admins silently
       }
 
-      // 1-second delay protects your Railway resources and prevents API bans
+      // SLOW DOWN: 1-second delay between users prevents Railway SIGTERM crashes
       await new Promise(r => setTimeout(r, 1000));
     }
-    if (channel) await channel.send("🏁 Deep Scan finished! Check Railway logs for details.");
+    if (channel) await channel.send("🏁 Deep Scan finished! Check Railway logs.");
+    console.log("🏁 DEEP SCAN FINISHED.");
+    console.log("-----------------------------------------");
   } catch (err) {
     console.error("❌ SYNC CRASHED:", err);
   }
@@ -94,7 +101,7 @@ async function checkDeadlinesAndKick() {
         }
       } catch (e) {}
     }
-  } catch (err) { console.error(err); }
+  } catch (err) { console.error("Reaper Error:", err); }
 }
 
 /* -------------------- 3. EVENTS -------------------- */
@@ -103,7 +110,7 @@ client.on("ready", () => {
   setInterval(checkDeadlinesAndKick, 10 * 60 * 1000); 
 });
 
-// Admin command: Type !sync in Discord to trigger
+// Admin command: Type !sync in Discord to trigger safely
 client.on("messageCreate", async (message) => {
   if (message.content === "!sync" && message.member.permissions.has(PermissionFlagsBits.Administrator)) {
     runRoleSync(message.channel);
@@ -121,7 +128,7 @@ client.on("interactionCreate", async (interaction) => {
         body: JSON.stringify({ discordId: interaction.user.id }),
       });
       const data = await response.json();
-      await interaction.reply({ content: `🔗 [Click here to verify](${data.url})`, ephemeral: true });
+      await interaction.reply({ content: `🔗 [Click here to verify subscription](${data.url})`, ephemeral: true });
     } catch (err) {
       await interaction.reply({ content: "❌ Backend connection error.", ephemeral: true });
     }
