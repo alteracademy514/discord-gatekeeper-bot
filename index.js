@@ -1,246 +1,180 @@
 require("dotenv").config();
-const { Client, GatewayIntentBits, Events, REST, Routes } = require("discord.js");
+const { 
+  Client, 
+  GatewayIntentBits, 
+  REST, 
+  Routes, 
+  SlashCommandBuilder, 
+  PermissionFlagsBits 
+} = require("discord.js");
 const { Pool } = require("pg");
-
-/* -------------------- CONFIG -------------------- */
-const ROLES = {
-  UNLINKED: "1462833260567597272",
-  ACTIVE_MEMBER: "1462832923970633768"
-};
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 });
 
+// --- CONFIGURATION ---
+const ROLES = {
+  UNLINKED: "1330559779389276274",     // Replace with your actual Unlinked Role ID
+  ACTIVE_MEMBER: "1330559648937902161" // Replace with your actual Active Member Role ID
+};
+
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers, // REQUIRED: Must be enabled in Dev Portal
+    GatewayIntentBits.GuildMessages,
+  ],
 });
 
-/* -------------------- COMMANDS -------------------- */
-const commands = [
-  { name: 'link', description: 'Get verification link' },
-  { name: 'check', description: 'Check status' },
-  { name: 'testkick', description: 'ADMIN ONLY: Force run the reaper now' }
-];
-
-const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
-
-(async () => {
-  try {
-    console.log('🔄 Reloading commands...');
-    await rest.put(
-      Routes.applicationGuildCommands(process.env.DISCORD_CLIENT_ID, process.env.DISCORD_GUILD_ID),
-      { body: commands },
-    );
-    console.log('✅ Commands loaded.');
-  } catch (error) { console.error(error); }
-})();
-
-/* -------------------- BOT LOGIC -------------------- */
-
-client.once(Events.ClientReady, (c) => {
-  console.log(`✅ Bot online as ${c.user.tag}`);
-  
-  // 1. Run the "Mass Enforcer" on startup
-  enforceAllUsers();
-
-  // 2. Sync Roles (Every 60 seconds)
-  setInterval(runRoleSync, 60 * 1000);
-  
-  // 3. The Reaper: Kicks expired users (Every 10 mins)
-  setInterval(checkDeadlinesAndKick, 10 * 60 * 1000);
-});
-
-// --- MASS ENFORCER (Run on Start) ---
-// Finds people NOT in the DB and gives them 24 hours.
-async function enforceAllUsers() {
-  console.log("👮 Starting Mass Enforcement Scan...");
-  const guild = client.guilds.cache.get(process.env.DISCORD_GUILD_ID);
-  if (!guild) return;
-
-  const members = await guild.members.fetch();
-  
-  members.forEach(async (member) => {
-    if (member.user.bot) return;
-
-    // Check if they are in the DB
-    const res = await pool.query("SELECT discord_id FROM users WHERE discord_id = $1", [member.id]);
-    
-    // If NOT in DB -> Brand New -> 24 Hours
-    if (res.rows.length === 0) {
-      console.log(`🆕 Found unknown user: ${member.user.tag}. Starting 24h timer.`);
-      
-      await pool.query(
-        `INSERT INTO users (discord_id, subscription_status, link_deadline)
-         VALUES ($1, 'unlinked', now() + interval '24 hours')`,
-        [member.id]
-      );
-      
-      try {
-        await member.roles.add(ROLES.UNLINKED);
-        await member.send(
-          `**Action Required!**\n` +
-          `You have **24 hours** to link your account or you will be removed from the server.\n` +
-          `Please go to the server and type **/link**.`
-        );
-      } catch (e) { console.log(`Could not DM ${member.user.tag}`); }
-    }
-  });
-}
-
-// --- WELCOMER: Smart Logic (New vs Returning) ---
-client.on(Events.GuildMemberAdd, async (member) => {
-  try {
-    await member.roles.add(ROLES.UNLINKED);
-    console.log(`🟡 User joined: ${member.user.tag}`);
-
-    // Check if they already exist in the DB
-    const checkRes = await pool.query("SELECT discord_id FROM users WHERE discord_id = $1", [member.id]);
-    
-    if (checkRes.rows.length > 0) {
-        // CASE A: RETURNING USER (Already in DB) -> 1 HOUR LIMIT
-        console.log(`♻️ Returning user detected: ${member.user.tag}. Limiting to 1 hour.`);
-        
-        await pool.query(
-            `UPDATE users 
-             SET link_deadline = now() + interval '1 hour', 
-                 subscription_status = 'unlinked'
-             WHERE discord_id = $1`,
-            [member.id]
-        );
-
-        try {
-          await member.send(
-            `**Welcome Back!**\n` +
-            `⚠️ Since you have been here before, you have **1 hour** to verify your subscription.\n` +
-            `Please type **/link** immediately.`
-          );
-        } catch (e) {}
-
-    } else {
-        // CASE B: BRAND NEW USER (Not in DB) -> 24 HOUR LIMIT
-        console.log(`✨ New user detected: ${member.user.tag}. Giving 24 hours.`);
-
-        await pool.query(
-            `INSERT INTO users (discord_id, subscription_status, link_deadline)
-             VALUES ($1, 'unlinked', now() + interval '24 hours')`,
-            [member.id]
-        );
-
-        try {
-          await member.send(
-            `**Welcome!**\n` +
-            `You have **24 hours** to link your account or you will be kicked.\n` +
-            `Please go to the server and type **/link** to get started.`
-          );
-        } catch (e) {}
-    }
-
-  } catch (err) { console.error("Join Error:", err); }
-});
-
-
-// --- THE REAPER ---
-async function checkDeadlinesAndKick() {
-  console.log("💀 The Reaper is checking deadlines...");
-  const guild = client.guilds.cache.get(process.env.DISCORD_GUILD_ID);
-  if (!guild) return;
-
-  try {
-    const res = await pool.query(
-      `SELECT discord_id FROM users 
-       WHERE subscription_status = 'unlinked'
-       AND link_deadline < now()`
-    );
-
-    for (const row of res.rows) {
-      try {
-        const member = await guild.members.fetch(row.discord_id);
-        
-        if (member.roles.cache.has(ROLES.ACTIVE_MEMBER)) continue;
-        if (!member.kickable) continue;
-
-        console.log(`🥾 KICKING ${member.user.tag}`);
-        await member.send(`You have been removed because you did not verify your subscription in time.`);
-        await member.kick(`Gatekeeper: Deadline expired`);
-
-      } catch (e) {}
-    }
-  } catch (err) { console.error("Reaper Error:", err); }
-}
-
-// --- SIMPLE SYNC ---
+/* -------------------- 1. SYNC LOGIC (DEEP SCAN) -------------------- */
 async function runRoleSync() {
+  console.log("👮 Starting Deep Enforcement Scan...");
   const guild = client.guilds.cache.get(process.env.DISCORD_GUILD_ID);
-  if (!guild) return;
-
-  try {
-    // 1. Handle ACTIVE users
-    const activeRes = await pool.query("SELECT discord_id FROM users WHERE subscription_status = 'active'");
-    for (const row of activeRes.rows) {
-      try {
-        const member = await guild.members.fetch(row.discord_id);
-        if (!member.roles.cache.has(ROLES.ACTIVE_MEMBER)) {
-            await member.roles.remove(ROLES.UNLINKED);
-            await member.roles.add(ROLES.ACTIVE_MEMBER);
-            console.log(`✅ Sync: Set ${member.user.tag} to Active`);
-        }
-      } catch (e) {}
-    }
-
-    // 2. Handle UNLINKED (Anyone NOT active needs Unlinked role)
-    const unlinkedRes = await pool.query("SELECT discord_id FROM users WHERE subscription_status = 'unlinked'");
-    for (const row of unlinkedRes.rows) {
-      try {
-        const member = await guild.members.fetch(row.discord_id);
-        if (member.roles.cache.has(ROLES.ACTIVE_MEMBER)) {
-            await member.roles.remove(ROLES.ACTIVE_MEMBER);
-            await member.roles.add(ROLES.UNLINKED);
-            console.log(`🔒 Sync: Set ${member.user.tag} to Unlinked`);
-        }
-      } catch (e) {}
-    }
-  } catch (err) { console.error("Sync Error:", err.message); }
-}
-
-// --- COMMANDS ---
-client.on(Events.InteractionCreate, async (interaction) => {
-  if (!interaction.isChatInputCommand()) return;
-
-  // UPDATED: Allows Owner OR Admin to run the test kick
-  if (interaction.commandName === "testkick") {
-    if (interaction.user.id === interaction.guild.ownerId || interaction.member.permissions.has("Administrator")) {
-        await interaction.reply({ content: "💀 Running Reaper Forcefully...", ephemeral: true });
-        await checkDeadlinesAndKick();
-    } else {
-        await interaction.reply({ content: "❌ You need Admin permissions.", ephemeral: true });
-    }
+  if (!guild) {
+    console.error("❌ Guild not found. Check DISCORD_GUILD_ID.");
+    return;
   }
 
+  try {
+    // 1. Force download ALL members from Discord servers
+    console.log("📥 Downloading full member list from Discord...");
+    const allMembers = await guild.members.fetch();
+    console.log(`✅ Downloaded ${allMembers.size} members.`);
+
+    // 2. Get every user from your database
+    const dbUsers = await pool.query("SELECT discord_id, subscription_status FROM users");
+    console.log(`📊 Processing ${dbUsers.rows.length} database entries...`);
+
+    let count = 0;
+    for (const row of dbUsers.rows) {
+      count++;
+      const member = allMembers.get(row.discord_id);
+      if (!member) continue;
+
+      try {
+        if (row.subscription_status === 'active') {
+          if (!member.roles.cache.has(ROLES.ACTIVE_MEMBER)) {
+            await member.roles.add(ROLES.ACTIVE_MEMBER);
+            await member.roles.remove(ROLES.UNLINKED);
+            console.log(`[${count}/${dbUsers.rows.length}] ✅ Restored Active: ${member.user.tag}`);
+          }
+        } else {
+          if (!member.roles.cache.has(ROLES.UNLINKED)) {
+            await member.roles.add(ROLES.UNLINKED);
+            await member.roles.remove(ROLES.ACTIVE_MEMBER);
+            console.log(`[${count}/${dbUsers.rows.length}] ⚠️ Applied Unlinked: ${member.user.tag}`);
+          }
+        }
+      } catch (roleErr) {
+        console.error(`❌ Role Error for ${member.user.tag}:`, roleErr.message);
+      }
+
+      // 3. Safety Delay: Wait 250ms between users to avoid Rate Limits
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+    console.log("🏁 Deep Scan Complete.");
+  } catch (err) {
+    console.error("❌ Sync Error:", err);
+  }
+}
+
+/* -------------------- 2. REAPER LOGIC -------------------- */
+async function checkDeadlinesAndKick() {
+  console.log("💀 The Reaper is checking deadlines...");
+  try {
+    const guild = await client.guilds.fetch(process.env.DISCORD_GUILD_ID);
+    const expired = await pool.query(
+      "SELECT discord_id FROM users WHERE subscription_status = 'unlinked' AND link_deadline < now()"
+    );
+
+    for (const row of expired.rows) {
+      try {
+        const member = await guild.members.fetch(row.discord_id);
+        if (member) {
+          await member.kick("Subscription expired/unlinked deadline reached.");
+          console.log(`👢 Kicked user: ${row.discord_id}`);
+        }
+      } catch (e) {
+        // Member already left or bot lacks permission
+      }
+    }
+  } catch (err) {
+    console.error("Reaper Error:", err);
+  }
+}
+
+/* -------------------- 3. BOT EVENTS -------------------- */
+client.once("ready", () => {
+  console.log(`✅ Bot online as ${client.user.tag}`);
+  runRoleSync();
+  setInterval(checkDeadlinesAndKick, 10 * 60 * 1000); // Check every 10 mins
+});
+
+// Auto-add "Unlinked" role when someone joins
+client.on("guildMemberAdd", async (member) => {
+  console.log(`🆕 ${member.user.tag} joined.`);
+  try {
+    const checkRes = await pool.query("SELECT * FROM users WHERE discord_id = $1", [member.id]);
+    
+    let deadline;
+    if (checkRes.rows.length > 0) {
+      deadline = "now() + interval '1 hour'"; // Returning user
+    } else {
+      deadline = "now() + interval '24 hours'"; // Fresh join
+      await pool.query(
+        "INSERT INTO users (discord_id, subscription_status, link_deadline) VALUES ($1, 'unlinked', now() + interval '24 hours')",
+        [member.id]
+      );
+    }
+
+    await member.roles.add(ROLES.UNLINKED);
+    member.send("Welcome! You have a limited time to link your subscription. Use `/link` in the server.");
+  } catch (err) {
+    console.error("Join Error:", err);
+  }
+});
+
+/* -------------------- 4. SLASH COMMANDS -------------------- */
+client.on("interactionCreate", async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+
   if (interaction.commandName === "link") {
-    await interaction.deferReply({ ephemeral: true });
     try {
-      const backendUrl = process.env.PUBLIC_BACKEND_URL || "https://discord-gatekeeper-backend-production.up.railway.app";
-      const resp = await fetch(`${backendUrl}/link/start`, {
+      const response = await fetch(`${process.env.PUBLIC_BACKEND_URL}/link/start`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ discordId: interaction.user.id }),
       });
-      const data = await resp.json();
-      await interaction.editReply({ 
-        content: `✅ **Verify Here:**\n${data.url}\n\n(Click -> Enter Email -> Check Inbox)` 
-      });
+      const data = await response.json();
+      await interaction.reply({ content: `🔗 [Click here to verify your subscription](${data.url})`, ephemeral: true });
     } catch (err) {
-      await interaction.editReply("❌ Service offline.");
+      await interaction.reply({ content: "❌ Error connecting to backend.", ephemeral: true });
     }
   }
 
   if (interaction.commandName === "check") {
-    await interaction.deferReply({ ephemeral: true });
-    await runRoleSync();
-    await interaction.editReply("✅ Sync complete.");
+    await interaction.reply("👮 Starting manual role sync...");
+    runRoleSync();
   }
 });
+
+/* -------------------- 5. DEPLOY COMMANDS -------------------- */
+const commands = [
+  new SlashCommandBuilder().setName("link").setDescription("Link your Stripe subscription"),
+  new SlashCommandBuilder().setName("check").setDescription("Manually force a role sync (Admin)")
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+].map(command => command.toJSON());
+
+const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
+(async () => {
+  try {
+    await rest.put(Routes.applicationGuildCommands(process.env.DISCORD_CLIENT_ID, process.env.DISCORD_GUILD_ID), { body: commands });
+    console.log("✅ Commands loaded.");
+  } catch (error) {
+    console.error(error);
+  }
+})();
 
 client.login(process.env.DISCORD_TOKEN);
