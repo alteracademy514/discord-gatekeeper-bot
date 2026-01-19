@@ -2,10 +2,8 @@ require("dotenv").config();
 const { Client, GatewayIntentBits, PermissionFlagsBits } = require("discord.js");
 const { Pool } = require("pg");
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-});
+// We move the Pool creation inside the function to save memory on startup
+let pool;
 
 const ROLES = {
   UNLINKED: "1330559779389276274",     
@@ -21,78 +19,63 @@ const client = new Client({
   ],
 });
 
-/* -------------------- 1. STEP-BY-STEP DEBUG SYNC -------------------- */
+/* -------------------- 1. STABLE SYNC -------------------- */
 async function runRoleSync(channel) {
-  console.log("🛠️ DEBUG: runRoleSync function triggered.");
-  const guild = client.guilds.cache.get(process.env.DISCORD_GUILD_ID);
+  console.log("🛠️ Starting Lazy Sync...");
   
-  if (!guild) {
-    console.log("❌ DEBUG: Guild not found! Check DISCORD_GUILD_ID.");
-    return;
+  // Connect to DB only when requested
+  if (!pool) {
+    pool = new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: { rejectUnauthorized: false },
+    });
   }
 
-  try {
-    if (channel) await channel.send("🔍 Debug: Querying Database...");
-    console.log("🛠️ DEBUG: Querying Postgres...");
-    
-    const { rows } = await pool.query("SELECT discord_id, subscription_status FROM users");
-    console.log(`🛠️ DEBUG: Database returned ${rows.length} rows.`);
+  const guild = client.guilds.cache.get(process.env.DISCORD_GUILD_ID);
+  if (!guild) return;
 
-    if (channel) await channel.send(`🔍 Debug: Found ${rows.length} records. Starting loop...`);
+  try {
+    const { rows } = await pool.query("SELECT discord_id, subscription_status FROM users");
+    console.log(`📊 DB returned ${rows.length} rows.`);
+
+    if (channel) await channel.send(`🔍 Syncing ${rows.length} records slowly...`);
 
     let successCount = 0;
-    for (let i = 0; i < rows.length; i++) {
-      const row = rows[i];
-      console.log(`🛠️ DEBUG: [${i+1}/${rows.length}] Checking ID: ${row.discord_id}`);
-
+    for (const row of rows) {
       try {
-        // Fetch specific member only to save memory
         const member = await guild.members.fetch(row.discord_id).catch(() => null);
-        
-        if (!member) {
-          console.log(`🛠️ DEBUG: Member ${row.discord_id} not in server. Skipping.`);
-          continue;
-        }
-
-        if (member.id === guild.ownerId) {
-          console.log(`🛠️ DEBUG: Skipping owner.`);
-          continue;
-        }
+        if (!member || member.id === guild.ownerId) continue;
 
         if (row.subscription_status === 'active') {
           if (!member.roles.cache.has(ROLES.ACTIVE_MEMBER)) {
             await member.roles.add(ROLES.ACTIVE_MEMBER);
             await member.roles.remove(ROLES.UNLINKED);
             successCount++;
-            console.log(`✅ [SYNC] ${member.user.tag} -> ACTIVE`);
+            console.log(`✅ ${member.user.tag} -> ACTIVE`);
           }
         } else {
           if (!member.roles.cache.has(ROLES.UNLINKED)) {
             await member.roles.add(ROLES.UNLINKED);
             await member.roles.remove(ROLES.ACTIVE_MEMBER);
             successCount++;
-            console.log(`⚠️ [SYNC] ${member.user.tag} -> UNLINKED`);
+            console.log(`⚠️ ${member.user.tag} -> UNLINKED`);
           }
         }
       } catch (e) {
-        console.log(`❌ DEBUG: Error processing ${row.discord_id}: ${e.message}`);
+        console.log(`❌ Error on ${row.discord_id}: ${e.message}`);
       }
-
-      // 3-second delay to keep Railway stable
-      await new Promise(r => setTimeout(r, 3000));
+      // 4-second delay: Very slow to keep Railway from killing the container
+      await new Promise(r => setTimeout(r, 4000));
     }
-    
-    if (channel) await channel.send(`🏁 Debug Sync Finished. Total updated: ${successCount}`);
-    console.log("🏁 DEBUG SYNC COMPLETE.");
+    if (channel) await channel.send(`🏁 Done! Updated ${successCount} users.`);
   } catch (err) {
-    console.error("❌ DEBUG CRITICAL ERROR:", err);
-    if (channel) await channel.send(`❌ Critical Error: ${err.message}`);
+    console.error("❌ CRITICAL ERROR:", err);
   }
 }
 
 /* -------------------- 2. MINIMAL EVENTS -------------------- */
 client.on("ready", () => {
-  console.log(`🚀 Bot Online: ${client.user.tag}`);
+  console.log(`🚀 Bot is Online: ${client.user.tag}`);
 });
 
 client.on("messageCreate", async (message) => {
@@ -101,4 +84,5 @@ client.on("messageCreate", async (message) => {
   }
 });
 
+// We log in with NO extra processing on the main thread
 client.login(process.env.DISCORD_TOKEN);
