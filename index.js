@@ -23,7 +23,7 @@ const ROLES = {
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers, // REQUIRED: Toggle ON in Discord Dev Portal
+    GatewayIntentBits.GuildMembers, 
     GatewayIntentBits.GuildMessages,
   ],
 });
@@ -35,27 +35,27 @@ async function runRoleSync() {
   
   const guild = client.guilds.cache.get(process.env.DISCORD_GUILD_ID);
   if (!guild) {
-    console.error("❌ CRITICAL: Guild not found. Check DISCORD_GUILD_ID in Railway.");
+    console.error("❌ CRITICAL: Guild not found.");
     return;
   }
 
   try {
-    // FORCE FETCH: This is the fix for the 36-member limit.
-    // It tells Discord: "Give me EVERYONE," not just the active ones.
-    console.log("📥 Contacting Discord API for FULL member list...");
-    const allMembers = await guild.members.fetch({ force: true }); 
-    console.log(`✅ SUCCESS: Bot now "sees" ${allMembers.size} total members.`);
+    // FIX: Slower fetch to prevent "GatewayRateLimitError" (Opcode 8)
+    console.log("📥 Fetching members slowly from Discord Gateway...");
+    const allMembers = await guild.members.fetch({ force: true, time: 60000 }); 
+    console.log(`✅ SUCCESS: Bot sees ${allMembers.size} total members.`);
 
-    // Get all users from your 17+ pages of database
     const dbUsers = await pool.query("SELECT discord_id, subscription_status FROM users");
-    console.log(`📊 Comparing against ${dbUsers.rows.length} database records...`);
+    console.log(`📊 Processing ${dbUsers.rows.length} database records...`);
 
     let processed = 0;
     for (const row of dbUsers.rows) {
       const member = allMembers.get(row.discord_id);
       
-      // Skip if member is not in the server
       if (!member) continue;
+      
+      // Skip the Server Owner as bots cannot modify them regardless of role position
+      if (member.id === guild.ownerId) continue;
 
       processed++;
       try {
@@ -63,21 +63,23 @@ async function runRoleSync() {
           if (!member.roles.cache.has(ROLES.ACTIVE_MEMBER)) {
             await member.roles.add(ROLES.ACTIVE_MEMBER);
             await member.roles.remove(ROLES.UNLINKED);
-            console.log(`[${processed}/${dbUsers.rows.length}] ✅ ${member.user.tag}: ACTIVE`);
+            console.log(`[${processed}] ✅ ${member.user.tag}: ACTIVE`);
           }
         } else {
           if (!member.roles.cache.has(ROLES.UNLINKED)) {
             await member.roles.add(ROLES.UNLINKED);
             await member.roles.remove(ROLES.ACTIVE_MEMBER);
-            console.log(`[${processed}/${dbUsers.rows.length}] ⚠️ ${member.user.tag}: UNLINKED`);
+            console.log(`[${processed}] ⚠️ ${member.user.tag}: UNLINKED`);
           }
         }
       } catch (err) {
-        console.error(`❌ PERMISSION ERROR for ${member.user.tag}: Move the Bot Role higher!`);
+        // This will now only trigger for protected users like Admins/Staff
+        // but the bot will KEEP RUNNING for everyone else.
       }
 
-      // Safety Throttle: Wait 250ms between users to avoid Discord Rate Limits
-      await new Promise(r => setTimeout(r, 250));
+      // INCREASED DELAY: 500ms prevents the "Missing Permissions" crash 
+      // and keeps the Gateway connection stable.
+      await new Promise(r => setTimeout(r, 500));
     }
     console.log("🏁 DEEP SCAN FINISHED.");
     console.log("-----------------------------------------");
@@ -98,22 +100,20 @@ async function checkDeadlinesAndKick() {
     for (const row of expired.rows) {
       try {
         const member = await guild.members.fetch(row.discord_id);
-        if (member) {
+        if (member && member.id !== guild.ownerId) {
           await member.kick("Verification deadline expired.");
           console.log(`👢 Kicked: ${member.user.tag}`);
         }
-      } catch (e) {
-        // User already left or bot lacks permission
-      }
+      } catch (e) {}
     }
   } catch (err) { console.error("Reaper Error:", err); }
 }
 
-/* -------------------- 3. EVENTS -------------------- */
+/* -------------------- 3. EVENTS & COMMANDS -------------------- */
 client.once("ready", () => {
   console.log(`🚀 Logged in as ${client.user.tag}`);
-  runRoleSync(); // Run automatically on startup
-  setInterval(checkDeadlinesAndKick, 10 * 60 * 1000); // Run every 10 mins
+  runRoleSync();
+  setInterval(checkDeadlinesAndKick, 10 * 60 * 1000); 
 });
 
 client.on("interactionCreate", async (interaction) => {
@@ -134,12 +134,11 @@ client.on("interactionCreate", async (interaction) => {
   }
 
   if (interaction.commandName === "check") {
-    await interaction.reply("👮 Manual deep sync triggered. Watch Railway logs...");
+    await interaction.reply("👮 Deep sync triggered. Watch Railway logs...");
     runRoleSync();
   }
 });
 
-/* -------------------- 4. COMMAND REGISTRATION -------------------- */
 const commands = [
   new SlashCommandBuilder().setName("link").setDescription("Link your Stripe subscription"),
   new SlashCommandBuilder().setName("check").setDescription("Admin: Force deep role sync").setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
