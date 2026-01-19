@@ -16,14 +16,14 @@ const pool = new Pool({
 
 // --- CONFIGURATION ---
 const ROLES = {
-  UNLINKED: "1330559779389276274",     // Replace with your actual Unlinked Role ID
-  ACTIVE_MEMBER: "1330559648937902161" // Replace with your actual Active Member Role ID
+  UNLINKED: "1330559779389276274",     
+  ACTIVE_MEMBER: "1330559648937902161" 
 };
 
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers, // REQUIRED: Must be enabled in Dev Portal
+    GatewayIntentBits.GuildMembers, // REQUIRED: Toggle this ON in Discord Dev Portal
     GatewayIntentBits.GuildMessages,
   ],
 });
@@ -33,17 +33,17 @@ async function runRoleSync() {
   console.log("👮 Starting Deep Enforcement Scan...");
   const guild = client.guilds.cache.get(process.env.DISCORD_GUILD_ID);
   if (!guild) {
-    console.error("❌ Guild not found. Check DISCORD_GUILD_ID.");
+    console.error("❌ Guild not found. Check DISCORD_GUILD_ID variable.");
     return;
   }
 
   try {
-    // 1. Force download ALL members from Discord servers
+    // Force download ALL members from Discord servers
     console.log("📥 Downloading full member list from Discord...");
     const allMembers = await guild.members.fetch();
     console.log(`✅ Downloaded ${allMembers.size} members.`);
 
-    // 2. Get every user from your database
+    // Get every user from your 17+ pages of database
     const dbUsers = await pool.query("SELECT discord_id, subscription_status FROM users");
     console.log(`📊 Processing ${dbUsers.rows.length} database entries...`);
 
@@ -71,7 +71,7 @@ async function runRoleSync() {
         console.error(`❌ Role Error for ${member.user.tag}:`, roleErr.message);
       }
 
-      // 3. Safety Delay: Wait 250ms between users to avoid Rate Limits
+      // Safety Delay: Wait 250ms between users to avoid Discord Rate Limits
       await new Promise(resolve => setTimeout(resolve, 250));
     }
     console.log("🏁 Deep Scan Complete.");
@@ -93,12 +93,10 @@ async function checkDeadlinesAndKick() {
       try {
         const member = await guild.members.fetch(row.discord_id);
         if (member) {
-          await member.kick("Subscription expired/unlinked deadline reached.");
-          console.log(`👢 Kicked user: ${row.discord_id}`);
+          await member.kick("Link deadline reached.");
+          console.log(`Booted: ${row.discord_id}`);
         }
-      } catch (e) {
-        // Member already left or bot lacks permission
-      }
+      } catch (e) {}
     }
   } catch (err) {
     console.error("Reaper Error:", err);
@@ -109,34 +107,25 @@ async function checkDeadlinesAndKick() {
 client.once("ready", () => {
   console.log(`✅ Bot online as ${client.user.tag}`);
   runRoleSync();
-  setInterval(checkDeadlinesAndKick, 10 * 60 * 1000); // Check every 10 mins
+  setInterval(checkDeadlinesAndKick, 10 * 60 * 1000); 
 });
 
-// Auto-add "Unlinked" role when someone joins
 client.on("guildMemberAdd", async (member) => {
-  console.log(`🆕 ${member.user.tag} joined.`);
   try {
     const checkRes = await pool.query("SELECT * FROM users WHERE discord_id = $1", [member.id]);
-    
-    let deadline;
-    if (checkRes.rows.length > 0) {
-      deadline = "now() + interval '1 hour'"; // Returning user
-    } else {
-      deadline = "now() + interval '24 hours'"; // Fresh join
+    if (checkRes.rows.length === 0) {
       await pool.query(
         "INSERT INTO users (discord_id, subscription_status, link_deadline) VALUES ($1, 'unlinked', now() + interval '24 hours')",
         [member.id]
       );
     }
-
     await member.roles.add(ROLES.UNLINKED);
-    member.send("Welcome! You have a limited time to link your subscription. Use `/link` in the server.");
   } catch (err) {
     console.error("Join Error:", err);
   }
 });
 
-/* -------------------- 4. SLASH COMMANDS -------------------- */
+/* -------------------- 4. COMMANDS -------------------- */
 client.on("interactionCreate", async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
@@ -148,23 +137,21 @@ client.on("interactionCreate", async (interaction) => {
         body: JSON.stringify({ discordId: interaction.user.id }),
       });
       const data = await response.json();
-      await interaction.reply({ content: `🔗 [Click here to verify your subscription](${data.url})`, ephemeral: true });
+      await interaction.reply({ content: `🔗 [Verify Here](${data.url})`, ephemeral: true });
     } catch (err) {
-      await interaction.reply({ content: "❌ Error connecting to backend.", ephemeral: true });
+      await interaction.reply({ content: "❌ Backend connection error.", ephemeral: true });
     }
   }
 
   if (interaction.commandName === "check") {
-    await interaction.reply("👮 Starting manual role sync...");
+    await interaction.reply("👮 Manual sync started...");
     runRoleSync();
   }
 });
 
-/* -------------------- 5. DEPLOY COMMANDS -------------------- */
 const commands = [
   new SlashCommandBuilder().setName("link").setDescription("Link your Stripe subscription"),
-  new SlashCommandBuilder().setName("check").setDescription("Manually force a role sync (Admin)")
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+  new SlashCommandBuilder().setName("check").setDescription("Manual role sync").setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 ].map(command => command.toJSON());
 
 const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
