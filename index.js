@@ -5,7 +5,7 @@ const {
   REST, 
   Routes, 
   SlashCommandBuilder, 
-  PermissionFlagsBits,
+  PermissionFlagsBits, 
   Events 
 } = require("discord.js");
 const { Pool } = require("pg");
@@ -29,80 +29,105 @@ const client = new Client({
   ],
 });
 
-/* -------------------- 1. STABLE EVENTS -------------------- */
+/* -------------------- 1. SLASH COMMANDS -------------------- */
+const commands = [
+  new SlashCommandBuilder()
+    .setName("link")
+    .setDescription("Get your unique link to verify your Stripe subscription"),
+].map(c => c.toJSON());
+
+const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
+
+/* -------------------- 2. BOT EVENTS -------------------- */
 
 client.once(Events.ClientReady, async (c) => {
   console.log(`🚀 Bot Online: ${c.user.tag}`);
-  
-  // Register commands AFTER a delay to let Railway settle
-  setTimeout(async () => {
-    const commands = [new SlashCommandBuilder().setName("link").setDescription("Get your subscription link")].map(c => c.toJSON());
-    const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
-    try {
-      await rest.put(Routes.applicationGuildCommands(process.env.DISCORD_CLIENT_ID, process.env.DISCORD_GUILD_ID), { body: commands });
-      console.log("✅ Commands registered.");
-    } catch (e) { console.error(e); }
-  }, 5000);
+  try {
+    await rest.put(
+      Routes.applicationGuildCommands(process.env.DISCORD_CLIENT_ID, process.env.DISCORD_GUILD_ID),
+      { body: commands }
+    );
+    console.log("✅ Slash command /link registered.");
+  } catch (error) {
+    console.error("❌ Registration failed:", error);
+  }
 });
 
-/* -------------------- 2. THE LINK COMMAND -------------------- */
+// AUTO-ASSIGN ROLE ON JOIN
+client.on(Events.GuildMemberAdd, async (member) => {
+  try {
+    await pool.query(
+      "INSERT INTO users (discord_id, subscription_status, link_deadline) VALUES ($1, 'unlinked', now() + interval '24 hours') ON CONFLICT (discord_id) DO NOTHING",
+      [member.id]
+    );
+    const role = member.guild.roles.cache.get(ROLES.UNLINKED);
+    if (role) await member.roles.add(role);
+    console.log(`✅ ${member.user.tag} auto-assigned UNLINKED role.`);
+  } catch (err) {
+    console.error("❌ Join logic error:", err);
+  }
+});
+
+/* -------------------- 3. COMMAND HANDLING -------------------- */
+
+client.on(Events.MessageCreate, async (message) => {
+  if (!message.member?.permissions.has(PermissionFlagsBits.Administrator)) return;
+
+  // --- NEW: DELETE ALL USERS FROM DATABASE ---
+  if (message.content === "!clear-db") {
+    try {
+      await message.reply("⚠️ **Wiping all users from database...**");
+      await pool.query("DELETE FROM users");
+      console.log("🔥 DATABASE WIPED BY ADMIN");
+      await message.channel.send("✅ **Database is now empty.** You can now run `!sync` to start fresh.");
+    } catch (err) {
+      console.error(err);
+      await message.reply("❌ Error wiping database.");
+    }
+  }
+
+  // --- SYNC CURRENT MEMBERS ---
+  if (message.content === "!sync") {
+    message.reply("🔄 **Starting Deep Sync...** adding missing users to DB and assigning roles.");
+    try {
+      const guild = message.guild;
+      const members = await guild.members.fetch();
+      for (const [id, member] of members) {
+        if (member.user.bot || id === guild.ownerId) continue;
+        await pool.query(
+          "INSERT INTO users (discord_id, subscription_status, link_deadline) VALUES ($1, 'unlinked', now() + interval '24 hours') ON CONFLICT (discord_id) DO NOTHING",
+          [id]
+        );
+        const res = await pool.query("SELECT subscription_status FROM users WHERE discord_id = $1", [id]);
+        if (res.rows[0]?.subscription_status !== 'active') {
+          await member.roles.add(ROLES.UNLINKED);
+        }
+        await new Promise(r => setTimeout(r, 1000)); 
+      }
+      message.channel.send("🏁 **Sync Complete.**");
+    } catch (err) {
+      console.error(err);
+      message.reply("❌ Sync failed.");
+    }
+  }
+});
+
+/* -------------------- 4. INTERACTION HANDLING -------------------- */
 
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
-
   if (interaction.commandName === "link") {
     try {
       await interaction.deferReply({ flags: [64] });
-
       const response = await fetch(`${process.env.PUBLIC_BACKEND_URL}/link/start`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ discordId: interaction.user.id }),
       });
-      
       const data = await response.json();
       await interaction.editReply({ content: `🔗 **Verify here:** ${data.url}` });
     } catch (err) {
-      await interaction.editReply({ content: "❌ Backend busy. Try again in a minute." });
-    }
-  }
-});
-
-/* -------------------- 3. THE MANUAL SYNC TRIGGER -------------------- */
-
-client.on(Events.MessageCreate, async (message) => {
-  if (message.content === "!sync" && message.member?.permissions.has(PermissionFlagsBits.Administrator)) {
-    const guild = message.guild;
-    message.reply("🔄 **Starting safe sync (2s delay per user)...**");
-
-    try {
-      const { rows } = await pool.query("SELECT discord_id, subscription_status FROM users");
-      
-      for (let i = 0; i < rows.length; i++) {
-        const row = rows[i];
-        try {
-          const member = await guild.members.fetch(row.discord_id).catch(() => null);
-          if (!member) continue;
-
-          const activeRole = guild.roles.cache.get(ROLES.ACTIVE_MEMBER);
-          const unlinkedRole = guild.roles.cache.get(ROLES.UNLINKED);
-
-          if (row.subscription_status === 'active') {
-            await member.roles.add(activeRole);
-            await member.roles.remove(unlinkedRole);
-            console.log(`✅ Active: ${member.user.tag}`);
-          } else {
-            await member.roles.add(unlinkedRole);
-            await member.roles.remove(activeRole);
-            console.log(`⚠️ Unlinked: ${member.user.tag}`);
-          }
-        } catch (err) {}
-        await new Promise(r => setTimeout(r, 2000));
-      }
-      message.channel.send("🏁 **Sync Complete.**");
-    } catch (dbErr) {
-      console.error(dbErr);
-      message.reply("❌ Database error.");
+      await interaction.editReply({ content: "❌ Backend busy. Try again shortly." });
     }
   }
 });
