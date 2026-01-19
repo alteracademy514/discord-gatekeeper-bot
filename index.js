@@ -37,16 +37,19 @@ async function runRoleSync() {
   if (!guild) return;
 
   try {
-    // FETCH: Downloads the 169+ members you have
+    // Fetch members and wait to ensure the list is ready
     console.log("📥 Fetching full member list...");
-    const allMembers = await guild.members.fetch({ force: true }); 
+    const allMembers = await guild.members.fetch(); 
     console.log(`✅ SUCCESS: Bot sees ${allMembers.size} total members.`);
 
     const dbUsers = await pool.query("SELECT discord_id, subscription_status FROM users");
-    
+    console.log(`📊 Comparing against ${dbUsers.rows.length} database records...`);
+
     let processed = 0;
     for (const row of dbUsers.rows) {
       const member = allMembers.get(row.discord_id);
+      
+      // Skip if member isn't in server or is the owner
       if (!member || member.id === guild.ownerId) continue;
 
       processed++;
@@ -55,25 +58,26 @@ async function runRoleSync() {
           if (!member.roles.cache.has(ROLES.ACTIVE_MEMBER)) {
             await member.roles.add(ROLES.ACTIVE_MEMBER);
             await member.roles.remove(ROLES.UNLINKED);
-            console.log(`[${processed}] ✅ ${member.user.tag}: ACTIVE`);
+            console.log(`[${processed}] ✅ SUCCESS: ${member.user.tag} set to ACTIVE`);
           }
         } else {
           if (!member.roles.cache.has(ROLES.UNLINKED)) {
             await member.roles.add(ROLES.UNLINKED);
             await member.roles.remove(ROLES.ACTIVE_MEMBER);
-            console.log(`[${processed}] ⚠️ ${member.user.tag}: UNLINKED`);
+            console.log(`[${processed}] ⚠️ SUCCESS: ${member.user.tag} set to UNLINKED`);
           }
         }
       } catch (err) {
-        // Skip admins/staff if bot lacks permission on them
+        // This catches permission errors without crashing the whole loop
       }
 
-      // Safety Throttle: 500ms between role changes
-      await new Promise(r => setTimeout(r, 500));
+      // SLOW DOWN: 1-second delay between users prevents Railway SIGTERM crashes
+      await new Promise(r => setTimeout(r, 1000));
     }
     console.log("🏁 DEEP SCAN FINISHED.");
+    console.log("-----------------------------------------");
   } catch (err) {
-    console.error("❌ SYNC FAILED:", err);
+    console.error("❌ SYNC CRASHED:", err);
   }
 }
 
@@ -95,13 +99,13 @@ async function checkDeadlinesAndKick() {
         }
       } catch (e) {}
     }
-  } catch (err) { console.error(err); }
+  } catch (err) { console.error("Reaper Error:", err); }
 }
 
 /* -------------------- 3. EVENTS -------------------- */
 client.on("ready", () => {
   console.log(`🚀 Logged in as ${client.user.tag}`);
-  // SYNC is NOT on boot to avoid Gateway Ban (Opcode 8)
+  // We do NOT run sync on boot to prevent Opcode 8 rate limits
   setInterval(checkDeadlinesAndKick, 10 * 60 * 1000); 
 });
 
@@ -123,17 +127,17 @@ client.on("interactionCreate", async (interaction) => {
   }
 
   if (interaction.commandName === "check") {
-    // FIX: Tells Discord to wait so it doesn't crash after 3 seconds
-    await interaction.deferReply({ ephemeral: true }); 
+    // FIX: Use flags: [64] to replace deprecated 'ephemeral'
+    await interaction.deferReply({ flags: [64] }); 
     console.log("👮 Deep sync triggered...");
     
     await runRoleSync(); 
     
-    await interaction.editReply("🏁 Deep sync complete! All members processed.");
+    await interaction.editReply("🏁 Deep sync complete!");
   }
 });
 
-/* -------------------- 4. REGISTRATION -------------------- */
+/* -------------------- 4. COMMAND REGISTRATION -------------------- */
 const commands = [
   new SlashCommandBuilder().setName("link").setDescription("Link your Stripe subscription"),
   new SlashCommandBuilder().setName("check").setDescription("Admin: Force deep role sync").setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
