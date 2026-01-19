@@ -1,6 +1,6 @@
 require("dotenv").config();
-const { Client, GatewayIntentBits, PermissionFlagsBits } = require("discord.js");
-const { Client: PgClient } = require("pg"); // Use Client instead of Pool for direct connection
+const { Client, GatewayIntentBits, PermissionFlagsBits, Events } = require("discord.js");
+const { Client: PgClient } = require("pg");
 
 const ROLES = {
   UNLINKED: "1462833260567597272",     
@@ -16,13 +16,12 @@ const client = new Client({
   ],
 });
 
-/* -------------------- 1. DIRECT SYNC LOGIC -------------------- */
+/* -------------------- 1. CHUNKED SYNC LOGIC -------------------- */
 async function runRoleSync(channel) {
-  console.log("🛠️ Starting On-Demand Sync...");
+  console.log("🛠️ Starting Chunked Sync...");
   const guild = client.guilds.cache.get(process.env.DISCORD_GUILD_ID);
   if (!guild) return;
 
-  // Create a fresh connection for this specific sync
   const db = new PgClient({
     connectionString: process.env.DATABASE_URL,
     ssl: { rejectUnauthorized: false },
@@ -30,18 +29,15 @@ async function runRoleSync(channel) {
 
   try {
     await db.connect();
-    console.log("🐘 Connected to Database.");
-
     const { rows } = await db.query("SELECT discord_id, subscription_status FROM users");
-    await db.end(); // Close DB connection immediately to save memory
-    console.log(`📊 Data fetched: ${rows.length} records. Syncing...`);
-
-    if (channel) await channel.send(`🔍 Found ${rows.length} records. Processing...`);
+    await db.end();
+    
+    if (channel) await channel.send(`🔍 Found ${rows.length} records. Syncing in chunks...`);
 
     let successCount = 0;
-    for (const row of rows) {
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
       try {
-        // Fetch specific member only when needed
         const member = await guild.members.fetch(row.discord_id).catch(() => null);
         if (!member || member.id === guild.ownerId) continue;
 
@@ -53,21 +49,27 @@ async function runRoleSync(channel) {
             await member.roles.add(activeRole);
             await member.roles.remove(unlinkedRole);
             successCount++;
-            console.log(`✅ Updated: ${member.user.tag}`);
+            console.log(`✅ [${i+1}] Updated: ${member.user.tag}`);
           }
         } else {
           if (!member.roles.cache.has(ROLES.UNLINKED)) {
             await member.roles.add(unlinkedRole);
             await member.roles.remove(activeRole);
             successCount++;
-            console.log(`⚠️ Unlinked: ${member.user.tag}`);
+            console.log(`⚠️ [${i+1}] Unlinked: ${member.user.tag}`);
           }
         }
       } catch (e) {
         console.log(`❌ Error on ${row.discord_id}: ${e.message}`);
       }
-      // 2-second delay to keep Railway CPU low
-      await new Promise(r => setTimeout(r, 2000));
+
+      // Every 10 users, take a longer 5-second break to satisfy Railway's health monitor
+      if (i > 0 && i % 10 === 0) {
+        console.log("☕ Taking a 5s breather for Railway health checks...");
+        await new Promise(r => setTimeout(r, 5000));
+      } else {
+        await new Promise(r => setTimeout(r, 2000));
+      }
     }
     if (channel) await channel.send(`🏁 Sync complete! Updated ${successCount} users.`);
   } catch (err) {
@@ -76,9 +78,10 @@ async function runRoleSync(channel) {
   }
 }
 
-/* -------------------- 2. EVENTS -------------------- */
-client.on("ready", () => {
-  console.log(`🚀 Bot is Online: ${client.user.tag}`);
+/* -------------------- 2. STABLE EVENTS -------------------- */
+// Using clientReady to stop the DeprecationWarning
+client.once(Events.ClientReady, (c) => {
+  console.log(`🚀 Bot is Online: ${c.user.tag}`);
 });
 
 client.on("messageCreate", async (message) => {
@@ -97,9 +100,10 @@ client.on("interactionCreate", async (interaction) => {
         body: JSON.stringify({ discordId: interaction.user.id }),
       });
       const data = await response.json();
-      await interaction.reply({ content: `🔗 [Click here to verify](${data.url})`, ephemeral: true });
+      // Use flags to replace deprecated ephemeral
+      await interaction.reply({ content: `🔗 [Click here to verify](${data.url})`, flags: [64] });
     } catch (err) {
-      await interaction.reply({ content: "❌ Backend connection error.", ephemeral: true });
+      await interaction.reply({ content: "❌ Backend connection error.", flags: [64] });
     }
   }
 });
