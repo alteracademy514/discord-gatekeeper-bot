@@ -74,8 +74,9 @@ client.once(Events.ClientReady, async () => {
 // AUTO-JOIN & MESSAGING
 client.on(Events.GuildMemberAdd, async (member) => {
   try {
+    const userId = member.id; // Correctly capture ID
     await member.roles.add(ROLES.UNLINKED);
-    const check = await pool.query("SELECT * FROM users WHERE discord_id = $1", [member.id]);
+    const check = await pool.query("SELECT * FROM users WHERE discord_id = $1", [userId]);
     const isReturning = check.rows.length > 0;
     const timeLimit = isReturning ? "1 hour" : "24 hours";
 
@@ -83,7 +84,7 @@ client.on(Events.GuildMemberAdd, async (member) => {
       `INSERT INTO users (discord_id, subscription_status, link_deadline) 
        VALUES ($1, 'unlinked', now() + interval '${timeLimit}') 
        ON CONFLICT (discord_id) DO UPDATE SET subscription_status = 'unlinked', link_deadline = now() + interval '${timeLimit}'`,
-      [member.id]
+      [userId]
     );
 
     const embed = new EmbedBuilder()
@@ -91,7 +92,7 @@ client.on(Events.GuildMemberAdd, async (member) => {
       .setDescription(`Welcome! You have **${timeLimit}** to link your subscription.\n\nType \`/link\` in the server to start.`)
       .setColor(isReturning ? "#FF0000" : "#FFA500");
 
-    await member.send({ embeds: [embed] }).catch(() => console.log("User DMs closed."));
+    await member.send({ embeds: [welcomeEmbed] }).catch(() => {});
   } catch (err) { console.error(err); }
 });
 
@@ -110,47 +111,45 @@ async function checkDeadlines() {
   } catch (err) { console.error(err); }
 }
 
-// FIXED INTERACTION HANDLER
 client.on(Events.InteractionCreate, async (interaction) => {
-  if (!interaction.isChatInputCommand()) return;
-  
-  if (interaction.commandName === "link") {
-    await interaction.deferReply({ ephemeral: true });
-    try {
-      const response = await fetch(`${process.env.PUBLIC_BACKEND_URL.replace(/\/$/, "")}/link/start`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ discord_id: interaction.user.id }),
-      });
+  if (!interaction.isChatInputCommand() || interaction.commandName !== "link") return;
+  await interaction.deferReply({ ephemeral: true });
+  try {
+    const response = await fetch(`${process.env.PUBLIC_BACKEND_URL.replace(/\/$/, "")}/link/start`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ discord_id: interaction.user.id }),
+    });
 
-      const rawData = await response.json();
-      console.log("📥 DEBUG: Backend responded with:", JSON.stringify(rawData));
+    const rawData = await response.json();
+    const finalLink = rawData.url || rawData.link || rawData.verificationUrl || rawData.data;
 
-      // Try every possible key the backend might be sending
-      const finalLink = rawData.url || rawData.link || rawData.verificationUrl || rawData.data;
-
-      if (finalLink) {
-        await interaction.editReply({ content: `🔗 **Verify here:** ${finalLink}` });
-      } else {
-        await interaction.editReply({ content: "❌ Backend error: Link data missing from response." });
-      }
-    } catch (err) { 
-      console.error("❌ Link Fetch Error:", err);
-      await interaction.editReply({ content: "❌ Connection error: Could not reach backend." }); 
+    if (finalLink) {
+      await interaction.editReply({ content: `🔗 **Verify here:** ${finalLink}` });
+    } else {
+      await interaction.editReply({ content: "❌ Backend error: Link missing." });
     }
-  }
+  } catch (err) { await interaction.editReply({ content: "❌ Connection error." }); }
 });
 
+// --- FIXED ADMIN SYNC COMMAND ---
 client.on(Events.MessageCreate, async (message) => {
   if (!message.member?.permissions.has(PermissionFlagsBits.Administrator)) return;
+  
   if (message.content === "!sync-existing") {
     const members = await message.guild.members.fetch();
+    let count = 0;
     for (const [id, m] of members) {
       if (m.roles.cache.has(ROLES.UNLINKED) && !m.user.bot) {
-        await pool.query("INSERT INTO users (discord_id, subscription_status, link_deadline) VALUES ($1, 'unlinked', now() + interval '24 hours') ON CONFLICT (discord_id) DO NOTHING", [id]);
+        // FIXED: Explicitly pass the ID ($1) to avoid the NULL error
+        await pool.query(
+          "INSERT INTO users (discord_id, subscription_status, link_deadline) VALUES ($1, 'unlinked', now() + interval '24 hours') ON CONFLICT (discord_id) DO NOTHING", 
+          [id]
+        );
+        count++;
       }
     }
-    message.reply("✅ Sync complete.");
+    message.reply(`✅ Successfully synced ${count} members with valid IDs.`);
   }
 });
 
