@@ -11,7 +11,6 @@ const {
 } = require("discord.js");
 const { Pool } = require("pg");
 
-// 1. DATABASE SETUP
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
@@ -31,7 +30,6 @@ const client = new Client({
   ],
 });
 
-// 2. SLASH COMMAND REGISTRATION
 const commands = [
   new SlashCommandBuilder()
     .setName("link")
@@ -40,7 +38,6 @@ const commands = [
 
 const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
 
-/* --- BOT STARTUP --- */
 client.once(Events.ClientReady, async () => {
   console.log(`🚀 Bot Active as ${client.user.tag}`);
   try {
@@ -49,40 +46,35 @@ client.once(Events.ClientReady, async () => {
       { body: commands }
     );
     console.log("✅ Slash commands registered.");
-    
-    // START KICK TIMER (Check every 10 Minutes)
     setInterval(checkDeadlines, 10 * 60 * 1000);
   } catch (err) { console.error("Startup Error:", err); }
 });
 
-/* --- AUTO-JOIN LOGIC (Role & Database) --- */
+/* --- FIXED JOIN LOGIC --- */
 client.on(Events.GuildMemberAdd, async (member) => {
   try {
     await member.roles.add(ROLES.UNLINKED);
+    const userId = member.id; // Ensure this isn't null
 
-    const check = await pool.query("SELECT * FROM users WHERE discord_id = $1", [member.id]);
+    const check = await pool.query("SELECT * FROM users WHERE discord_id = $1", [userId]);
 
     if (check.rows.length > 0) {
-      // Returning user gets 1 HOUR
       await pool.query(
         "UPDATE users SET subscription_status = 'unlinked', link_deadline = now() + interval '1 hour' WHERE discord_id = $1",
-        [member.id]
+        [userId]
       );
-      console.log(`⏳ ${member.user.tag} (Returning) - 1 Hour deadline set.`);
+      console.log(`⏳ ${member.user.tag} (Returning) - 1 Hour set.`);
     } else {
-      // New user gets 24 HOURS
       await pool.query(
         "INSERT INTO users (discord_id, subscription_status, link_deadline) VALUES ($1, 'unlinked', now() + interval '24 hours')",
-        [member.id]
+        [userId]
       );
-      console.log(`🆕 ${member.user.tag} (New) - 24 Hour deadline set.`);
+      console.log(`🆕 ${member.user.tag} (New) - 24 Hour set.`);
     }
   } catch (err) { console.error("Join Error:", err); }
 });
 
-/* --- THE KICK LOGIC --- */
 async function checkDeadlines() {
-  console.log("⏰ Checking for expired deadlines...");
   try {
     const guild = await client.guilds.fetch(process.env.DISCORD_GUILD_ID);
     const expiredUsers = await pool.query(
@@ -93,40 +85,37 @@ async function checkDeadlines() {
       try {
         const member = await guild.members.fetch(row.discord_id);
         if (member && member.roles.cache.has(ROLES.UNLINKED)) {
-          // Double check they aren't 'active' now before kicking
           const statusCheck = await pool.query("SELECT subscription_status FROM users WHERE discord_id = $1", [row.discord_id]);
           if (statusCheck.rows[0]?.subscription_status !== 'active') {
              await member.kick("Link deadline expired.");
-             console.log(`👞 Kicked ${member.user.tag}`);
           }
         }
-      } catch (e) { /* Member likely already left */ }
+      } catch (e) { }
     }
   } catch (err) { console.error("Kick loop error:", err); }
 }
 
-/* --- ADMIN COMMANDS --- */
 client.on(Events.MessageCreate, async (message) => {
   if (!message.member?.permissions.has(PermissionFlagsBits.Administrator)) return;
 
   if (message.content === "!broadcast-link") {
     const embed = new EmbedBuilder()
       .setTitle("📢 Action Required: Link Your Subscription")
-      .setDescription("Please use the command **/link** to verify your account.\n\nNew members: **24 hours** to link.\nReturning members: **1 hour** to link.\n\nFailure to link will result in automatic removal.")
-      .setColor("#FF0000")
-      .setFooter({ text: "Type /link to start" });
-    
+      .setDescription("Please use **/link** to verify.\n\nNew: **24h** | Returning: **1h**")
+      .setColor("#FF0000");
     await message.channel.send({ embeds: [embed] });
   }
 
+  /* --- FIXED SYNC LOGIC --- */
   if (message.content === "!sync-existing") {
     const members = await message.guild.members.fetch();
     let count = 0;
     for (const [id, m] of members) {
       if (m.roles.cache.has(ROLES.UNLINKED) && !m.user.bot) {
+        // Explicitly passing 'id' to fix the NULL error
         await pool.query(
           "INSERT INTO users (discord_id, subscription_status, link_deadline) VALUES ($1, 'unlinked', now() + interval '24 hours') ON CONFLICT (discord_id) DO NOTHING",
-          [m.id]
+          [id] 
         );
         count++;
       }
@@ -140,13 +129,13 @@ client.on(Events.MessageCreate, async (message) => {
   }
 });
 
-/* --- LINK COMMAND HANDLING (FIXED FOR UNDEFINED) --- */
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
   if (interaction.commandName === "link") {
     await interaction.deferReply({ flags: [64] });
     try {
+      // Sending 'discord_id' to backend
       const response = await fetch(`${process.env.PUBLIC_BACKEND_URL}/link/start`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -154,23 +143,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
       });
 
       const data = await response.json();
-      console.log("📥 Backend Data Received:", data);
-
-      // Check multiple possible key names from the backend
       const finalLink = data.url || data.link || data.verificationUrl;
 
       if (finalLink) {
-        await interaction.editReply({ 
-          content: `🔗 **Verify here:** ${finalLink}\n\nEnter your Stripe email at the link above to secure your account.` 
-        });
+        await interaction.editReply({ content: `🔗 **Verify here:** ${finalLink}` });
       } else {
-        await interaction.editReply({ 
-          content: "❌ Backend failed to provide a link. Check Railway logs for data structure." 
-        });
+        await interaction.editReply({ content: "❌ Backend failed to provide a link." });
       }
     } catch (err) {
-      console.error("Link Command Error:", err);
-      await interaction.editReply({ content: "❌ Connection error with verification server." });
+      await interaction.editReply({ content: "❌ Connection error." });
     }
   }
 });
