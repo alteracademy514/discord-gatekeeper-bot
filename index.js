@@ -62,12 +62,10 @@ client.once(Events.ClientReady, async () => {
   ].map(c => c.toJSON());
 
   try {
-    // Registering specifically to your Guild for instant updates
     await rest.put(
       Routes.applicationGuildCommands(process.env.DISCORD_CLIENT_ID, process.env.DISCORD_GUILD_ID),
       { body: commands }
     );
-    
     console.log("✅ Command sync complete.");
     setInterval(checkDeadlines, 10 * 60 * 1000);
   } catch (error) { console.error("Registration Error:", error); }
@@ -112,11 +110,11 @@ async function checkDeadlines() {
   } catch (err) { console.error(err); }
 }
 
+// FIXED INTERACTION HANDLER
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
   
   if (interaction.commandName === "link") {
-    // ephemeral: true keeps the response private to the user
     await interaction.deferReply({ ephemeral: true });
     try {
       const response = await fetch(`${process.env.PUBLIC_BACKEND_URL.replace(/\/$/, "")}/link/start`, {
@@ -124,9 +122,22 @@ client.on(Events.InteractionCreate, async (interaction) => {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ discord_id: interaction.user.id }),
       });
-      const data = await response.json();
-      await interaction.editReply({ content: `🔗 **Verify here:** ${data.url || data.link}` });
-    } catch (err) { await interaction.editReply({ content: "❌ Connection error." }); }
+
+      const rawData = await response.json();
+      console.log("📥 DEBUG: Backend responded with:", JSON.stringify(rawData));
+
+      // Try every possible key the backend might be sending
+      const finalLink = rawData.url || rawData.link || rawData.verificationUrl || rawData.data;
+
+      if (finalLink) {
+        await interaction.editReply({ content: `🔗 **Verify here:** ${finalLink}` });
+      } else {
+        await interaction.editReply({ content: "❌ Backend error: Link data missing from response." });
+      }
+    } catch (err) { 
+      console.error("❌ Link Fetch Error:", err);
+      await interaction.editReply({ content: "❌ Connection error: Could not reach backend." }); 
+    }
   }
 });
 
