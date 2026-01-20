@@ -2,11 +2,11 @@ require("dotenv").config();
 const { 
   Client, 
   GatewayIntentBits, 
-  REST, 
-  Routes, 
-  SlashCommandBuilder, 
   PermissionFlagsBits, 
-  Events 
+  Events,
+  SlashCommandBuilder,
+  REST,
+  Routes
 } = require("discord.js");
 const { Pool } = require("pg");
 
@@ -38,10 +38,9 @@ const commands = [
 
 const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
 
-/* -------------------- 2. BOT EVENTS -------------------- */
-
+/* -------------------- 2. BOT STARTUP -------------------- */
 client.once(Events.ClientReady, async (c) => {
-  console.log(`🚀 Bot Online: ${c.user.tag}`);
+  console.log(`🚀 Bot is Online: ${c.user.tag}`);
   try {
     await rest.put(
       Routes.applicationGuildCommands(process.env.DISCORD_CLIENT_ID, process.env.DISCORD_GUILD_ID),
@@ -53,71 +52,56 @@ client.once(Events.ClientReady, async (c) => {
   }
 });
 
-// AUTO-ASSIGN ROLE ON JOIN
-client.on(Events.GuildMemberAdd, async (member) => {
-  try {
-    await pool.query(
-      "INSERT INTO users (discord_id, subscription_status, link_deadline) VALUES ($1, 'unlinked', now() + interval '24 hours') ON CONFLICT (discord_id) DO NOTHING",
-      [member.id]
-    );
-    const role = member.guild.roles.cache.get(ROLES.UNLINKED);
-    if (role) await member.roles.add(role);
-    console.log(`✅ ${member.user.tag} auto-assigned UNLINKED role.`);
-  } catch (err) {
-    console.error("❌ Join logic error:", err);
-  }
-});
-
-/* -------------------- 3. COMMAND HANDLING -------------------- */
-
+/* -------------------- 3. ADMIN COMMANDS (SILENT TO USERS) -------------------- */
 client.on(Events.MessageCreate, async (message) => {
   if (!message.member?.permissions.has(PermissionFlagsBits.Administrator)) return;
 
-  // --- NEW: DELETE ALL USERS FROM DATABASE ---
+  // WIPE DATABASE
   if (message.content === "!clear-db") {
     try {
-      await message.reply("⚠️ **Wiping all users from database...**");
       await pool.query("DELETE FROM users");
-      console.log("🔥 DATABASE WIPED BY ADMIN");
-      await message.channel.send("✅ **Database is now empty.** You can now run `!sync` to start fresh.");
-    } catch (err) {
-      console.error(err);
-      await message.reply("❌ Error wiping database.");
-    }
+      await message.reply("✅ **Database cleared.** (No users were messaged)");
+    } catch (err) { console.error(err); }
   }
 
-  // --- SYNC CURRENT MEMBERS ---
-  if (message.content === "!sync") {
-    message.reply("🔄 **Starting Deep Sync...** adding missing users to DB and assigning roles.");
+  // BATCH SYNC 10 USERS
+  if (message.content === "!sync-10") {
+    await message.reply("🔄 **Syncing next 10 members in the background...**");
     try {
       const guild = message.guild;
-      const members = await guild.members.fetch();
-      for (const [id, member] of members) {
-        if (member.user.bot || id === guild.ownerId) continue;
+      const membersMap = await guild.members.fetch();
+      const membersArray = Array.from(membersMap.values()).filter(m => !m.user.bot && m.id !== guild.ownerId);
+
+      let processed = 0;
+      for (const member of membersArray) {
+        if (processed >= 10) break;
+
         await pool.query(
           "INSERT INTO users (discord_id, subscription_status, link_deadline) VALUES ($1, 'unlinked', now() + interval '24 hours') ON CONFLICT (discord_id) DO NOTHING",
-          [id]
+          [member.id]
         );
-        const res = await pool.query("SELECT subscription_status FROM users WHERE discord_id = $1", [id]);
-        if (res.rows[0]?.subscription_status !== 'active') {
+
+        const res = await pool.query("SELECT subscription_status FROM users WHERE discord_id = $1", [member.id]);
+        if (res.rows[0]?.subscription_status === 'active') {
+          await member.roles.add(ROLES.ACTIVE_MEMBER);
+          await member.roles.remove(ROLES.UNLINKED);
+        } else {
           await member.roles.add(ROLES.UNLINKED);
         }
-        await new Promise(r => setTimeout(r, 1000)); 
+        processed++;
+        await new Promise(r => setTimeout(r, 1500)); 
       }
-      message.channel.send("🏁 **Sync Complete.**");
-    } catch (err) {
-      console.error(err);
-      message.reply("❌ Sync failed.");
-    }
+      await message.channel.send(`🏁 Batch complete. Processed ${processed} users. (No DMs were sent)`);
+    } catch (err) { console.error(err); }
   }
 });
 
-/* -------------------- 4. INTERACTION HANDLING -------------------- */
-
+/* -------------------- 4. USER INITIATED (/LINK) -------------------- */
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
   if (interaction.commandName === "link") {
     try {
+      // flags: 64 ensures ONLY the user who typed /link sees this reply
       await interaction.deferReply({ flags: [64] });
       const response = await fetch(`${process.env.PUBLIC_BACKEND_URL}/link/start`, {
         method: "POST",
@@ -127,7 +111,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const data = await response.json();
       await interaction.editReply({ content: `🔗 **Verify here:** ${data.url}` });
     } catch (err) {
-      await interaction.editReply({ content: "❌ Backend busy. Try again shortly." });
+      await interaction.editReply({ content: "❌ Connection error." });
     }
   }
 });
