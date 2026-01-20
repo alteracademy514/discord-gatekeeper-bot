@@ -1,15 +1,13 @@
 require("dotenv").config();
+const express = require("express"); // Added for instant webhooks
 const { 
-  Client, 
-  GatewayIntentBits, 
-  PermissionFlagsBits, 
-  Events, 
-  SlashCommandBuilder, 
-  REST, 
-  Routes, 
-  EmbedBuilder 
+  Client, GatewayIntentBits, PermissionFlagsBits, Events, 
+  SlashCommandBuilder, REST, Routes, EmbedBuilder 
 } = require("discord.js");
 const { Pool } = require("pg");
+
+const app = express();
+app.use(express.json());
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -23,17 +21,41 @@ const ROLES = {
 
 const client = new Client({
   intents: [
-    GatewayIntentBits.Guilds, 
-    GatewayIntentBits.GuildMembers, 
-    GatewayIntentBits.GuildMessages, 
-    GatewayIntentBits.MessageContent
+    GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, 
+    GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent
   ],
 });
 
+// --- 1. THE INSTANT WEBHOOK (For the Backend to call) ---
+app.post("/update-role", async (req, res) => {
+  const { discord_id, status } = req.body;
+  
+  if (status === 'active') {
+    try {
+      const guild = await client.guilds.fetch(process.env.DISCORD_GUILD_ID);
+      const member = await guild.members.fetch(discord_id);
+      
+      if (member) {
+        await member.roles.add(ROLES.ACTIVE_MEMBER);
+        await member.roles.remove(ROLES.UNLINKED);
+        console.log(`⚡ INSTANT SYNC: ${member.user.tag} is now Active.`);
+        return res.status(200).send({ message: "Role updated" });
+      }
+    } catch (err) {
+      console.error("Webhook Role Error:", err);
+      return res.status(500).send({ error: "Member not found or role error" });
+    }
+  }
+  res.status(400).send({ message: "No action taken" });
+});
+
+// Start the webhook server on Railway
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`📡 Webhook listener open on port ${PORT}`));
+
+/* --- REST OF BOT LOGIC --- */
 const commands = [
-  new SlashCommandBuilder()
-    .setName("link")
-    .setDescription("Link your Stripe subscription to keep access"),
+  new SlashCommandBuilder().setName("link").setDescription("Link your Stripe subscription"),
 ].map(c => c.toJSON());
 
 const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
@@ -45,40 +67,14 @@ client.once(Events.ClientReady, async () => {
       Routes.applicationGuildCommands(process.env.DISCORD_CLIENT_ID, process.env.DISCORD_GUILD_ID),
       { body: commands }
     );
-    console.log("✅ Commands Registered.");
-    setInterval(checkDeadlines, 10 * 60 * 1000);
-  } catch (err) { console.error("Startup Error:", err); }
+    setInterval(syncRolesAndDeadlines, 10 * 60 * 1000); // Keep as backup
+  } catch (err) { console.error(err); }
 });
 
-// AUTO-JOIN LOGIC
-client.on(Events.GuildMemberAdd, async (member) => {
-  try {
-    await member.roles.add(ROLES.UNLINKED);
-    const userId = member.id;
-    const check = await pool.query("SELECT * FROM users WHERE discord_id = $1", [userId]);
-
-    if (check.rows.length > 0) {
-      await pool.query(
-        "UPDATE users SET subscription_status = 'unlinked', link_deadline = now() + interval '1 hour' WHERE discord_id = $1",
-        [userId]
-      );
-    } else {
-      await pool.query(
-        "INSERT INTO users (discord_id, subscription_status, link_deadline) VALUES ($1, 'unlinked', now() + interval '24 hours')",
-        [userId]
-      );
-    }
-  } catch (err) { console.error("Join Error:", err); }
-});
-
-// KICK LOGIC
-async function checkDeadlines() {
+async function syncRolesAndDeadlines() {
   try {
     const guild = await client.guilds.fetch(process.env.DISCORD_GUILD_ID);
-    const expiredUsers = await pool.query(
-      "SELECT discord_id FROM users WHERE subscription_status = 'unlinked' AND link_deadline < now()"
-    );
-
+    const expiredUsers = await pool.query("SELECT discord_id FROM users WHERE subscription_status = 'unlinked' AND link_deadline < now()");
     for (const row of expiredUsers.rows) {
       try {
         const member = await guild.members.fetch(row.discord_id);
@@ -87,67 +83,36 @@ async function checkDeadlines() {
         }
       } catch (e) { }
     }
-  } catch (err) { console.error("Kick loop error:", err); }
+  } catch (err) { console.error(err); }
 }
 
-// ADMIN COMMANDS
-client.on(Events.MessageCreate, async (message) => {
-  if (!message.member?.permissions.has(PermissionFlagsBits.Administrator)) return;
-
-  if (message.content === "!broadcast-link") {
-    const embed = new EmbedBuilder()
-      .setTitle("📢 Action Required: Link Your Subscription")
-      .setDescription("Please use **/link** to verify.\n\nNew: **24h** | Returning: **1h**")
-      .setColor("#FF0000");
-    await message.channel.send({ embeds: [embed] });
-  }
-
-  if (message.content === "!sync-existing") {
-    const members = await message.guild.members.fetch();
-    let count = 0;
-    for (const [id, m] of members) {
-      if (m.roles.cache.has(ROLES.UNLINKED) && !m.user.bot) {
-        await pool.query(
-          "INSERT INTO users (discord_id, subscription_status, link_deadline) VALUES ($1, 'unlinked', now() + interval '24 hours') ON CONFLICT (discord_id) DO NOTHING",
-          [id]
-        );
-        count++;
-      }
-    }
-    message.reply(`✅ Synced ${count} users.`);
-  }
+client.on(Events.GuildMemberAdd, async (member) => {
+  try {
+    await member.roles.add(ROLES.UNLINKED);
+    const check = await pool.query("SELECT * FROM users WHERE discord_id = $1", [member.id]);
+    const interval = check.rows.length > 0 ? '1 hour' : '24 hours';
+    await pool.query(
+      `INSERT INTO users (discord_id, subscription_status, link_deadline) 
+       VALUES ($1, 'unlinked', now() + interval '${interval}') 
+       ON CONFLICT (discord_id) DO UPDATE SET subscription_status = 'unlinked', link_deadline = now() + interval '${interval}'`,
+      [member.id]
+    );
+  } catch (err) { console.error(err); }
 });
 
-// FIXED LINK HANDLING
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
-
   if (interaction.commandName === "link") {
     await interaction.deferReply({ flags: [64] });
     try {
-      // Send BOTH common ID formats to ensure the backend receives it
       const response = await fetch(`${process.env.PUBLIC_BACKEND_URL}/link/start`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ 
-            discord_id: interaction.user.id,
-            discordId: interaction.user.id 
-        }),
+        body: JSON.stringify({ discord_id: interaction.user.id }),
       });
-
       const data = await response.json();
-      const finalLink = data.url || data.link || data.verificationUrl;
-
-      if (finalLink) {
-        await interaction.editReply({ content: `🔗 **Verify here:** ${finalLink}` });
-      } else {
-        console.error("Backend Error Data:", data);
-        await interaction.editReply({ content: "❌ Backend failed to provide a link. Check your Stripe setup." });
-      }
-    } catch (err) {
-      console.error("Fetch Error:", err);
-      await interaction.editReply({ content: "❌ Connection error with the verification server." });
-    }
+      await interaction.editReply({ content: `🔗 **Verify here:** ${data.url || data.link}` });
+    } catch (err) { await interaction.editReply({ content: "❌ Connection error." }); }
   }
 });
 
