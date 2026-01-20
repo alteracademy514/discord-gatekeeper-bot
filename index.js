@@ -30,7 +30,7 @@ const client = new Client({
   ],
 });
 
-// WEBHOOK FOR INSTANT ROLE UPDATE
+// INSTANT ROLE UPDATE WEBHOOK
 app.post("/update-role", async (req, res) => {
   const { discord_id, status } = req.body;
   if (status === 'active') {
@@ -40,7 +40,7 @@ app.post("/update-role", async (req, res) => {
       if (member) {
         await member.roles.add(ROLES.ACTIVE_MEMBER);
         await member.roles.remove(ROLES.UNLINKED);
-        console.log(`✅ Success: ${member.user.tag} upgraded to Active.`);
+        console.log(`✅ ${member.user.tag} upgraded to Active.`);
         return res.status(200).send({ message: "Updated" });
       }
     } catch (err) { return res.status(500).send({ error: "Sync failed" }); }
@@ -59,20 +59,16 @@ client.once(Events.ClientReady, async () => {
     new SlashCommandBuilder()
       .setName("link")
       .setDescription("Get your Stripe verification link")
-      .setDMPermission(true) // Crucial for visibility
   ].map(c => c.toJSON());
 
   try {
-    console.log("🧹 Clearing Global Commands...");
-    await rest.put(Routes.applicationCommands(process.env.DISCORD_CLIENT_ID), { body: [] });
-
-    console.log("🔄 Refreshing Guild Commands...");
+    // Registering specifically to your Guild for instant updates
     await rest.put(
       Routes.applicationGuildCommands(process.env.DISCORD_CLIENT_ID, process.env.DISCORD_GUILD_ID),
       { body: commands }
     );
     
-    console.log("✅ Command sync complete. Command should appear now.");
+    console.log("✅ Command sync complete.");
     setInterval(checkDeadlines, 10 * 60 * 1000);
   } catch (error) { console.error("Registration Error:", error); }
 });
@@ -118,8 +114,10 @@ async function checkDeadlines() {
 
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
+  
   if (interaction.commandName === "link") {
-    await interaction.deferReply({ flags: [64] });
+    // ephemeral: true keeps the response private to the user
+    await interaction.deferReply({ ephemeral: true });
     try {
       const response = await fetch(`${process.env.PUBLIC_BACKEND_URL.replace(/\/$/, "")}/link/start`, {
         method: "POST",
