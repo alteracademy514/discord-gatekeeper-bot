@@ -30,10 +30,10 @@ const client = new Client({
   ],
 });
 
-// INSTANT ROLE UPDATE WEBHOOK
+// --- 1. WEBHOOK (Still keeps it instant if backend connects) ---
 app.post("/update-role", async (req, res) => {
   const { discord_id, discordId, status } = req.body;
-  const targetId = discord_id || discordId; // Handle both formats from backend
+  const targetId = discord_id || discordId;
   
   if (status === 'active' && targetId) {
     try {
@@ -42,7 +42,7 @@ app.post("/update-role", async (req, res) => {
       if (member) {
         await member.roles.add(ROLES.ACTIVE_MEMBER);
         await member.roles.remove(ROLES.UNLINKED);
-        console.log(`✅ ${member.user.tag} upgraded to Active.`);
+        console.log(`⚡ Webhook: ${member.user.tag} upgraded to Active.`);
         return res.status(200).send({ message: "Updated" });
       }
     } catch (err) { return res.status(500).send({ error: "Sync failed" }); }
@@ -52,12 +52,12 @@ app.post("/update-role", async (req, res) => {
 
 app.listen(process.env.PORT || 3000);
 
-// STARTUP: REFRESH COMMANDS
+// --- 2. STARTUP ---
 client.once(Events.ClientReady, async () => {
   console.log(`🚀 Bot logged in as ${client.user.tag}`);
   const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
   const commands = [
-    new SlashCommandBuilder().setName("link").setDescription("Get your Stripe verification link")
+    new SlashCommandBuilder().setName("link").setDescription("Get your Stripe verification link").setDMPermission(true)
   ].map(c => c.toJSON());
 
   try {
@@ -66,11 +66,63 @@ client.once(Events.ClientReady, async () => {
       { body: commands }
     );
     console.log("✅ Commands live.");
-    setInterval(checkDeadlines, 10 * 60 * 1000);
+    
+    // 🔥 RUN CHECKS EVERY 30 SECONDS (Feels Instant)
+    setInterval(() => runSystemChecks(null), 30 * 1000);
+    
   } catch (error) { console.error(error); }
 });
 
-// AUTO-JOIN & MESSAGING
+// --- 3. THE DUAL-ACTION LOOP (Promote & Kick) ---
+async function runSystemChecks(manualChannel = null) {
+  try {
+    const guild = await client.guilds.fetch(process.env.DISCORD_GUILD_ID);
+    
+    // --- PART A: PROMOTE ACTIVE USERS ---
+    // Finds anyone in DB who is 'active' but still has 'Unlinked' role in Discord
+    const activeUsers = await pool.query("SELECT discord_id FROM users WHERE subscription_status = 'active'");
+    let promoted = 0;
+
+    for (const row of activeUsers.rows) {
+      try {
+        const member = await guild.members.fetch(row.discord_id);
+        if (member && member.roles.cache.has(ROLES.UNLINKED)) {
+           await member.roles.add(ROLES.ACTIVE_MEMBER);
+           await member.roles.remove(ROLES.UNLINKED);
+           console.log(`🔄 Auto-Promote: ${member.user.tag} is now Active.`);
+           promoted++;
+        }
+      } catch (e) { /* Member left server or ID invalid */ }
+    }
+
+    // --- PART B: KICK EXPIRED USERS ---
+    // Finds anyone 'unlinked' whose time is up
+    const expiredUsers = await pool.query("SELECT discord_id FROM users WHERE subscription_status = 'unlinked' AND link_deadline < now()");
+    let kicked = 0;
+
+    for (const row of expiredUsers.rows) {
+      try {
+        const member = await guild.members.fetch(row.discord_id);
+        if (member && member.roles.cache.has(ROLES.UNLINKED)) {
+           if (member.kickable) {
+             await member.kick("Link deadline expired.");
+             console.log(`👞 Auto-Kick: ${member.user.tag}`);
+             kicked++;
+           } else {
+             console.error(`⚠️ Cannot kick ${member.user.tag} (Check Bot Hierarchy)`);
+           }
+        }
+      } catch (e) { /* Member likely already gone */ }
+    }
+
+    if (manualChannel) {
+        manualChannel.send(`**System Check Complete:**\n✨ Promoted: ${promoted}\n👞 Kicked: ${kicked}`);
+    }
+
+  } catch (err) { console.error("System Check Error:", err); }
+}
+
+// --- 4. NEW MEMBER HANDLING ---
 client.on(Events.GuildMemberAdd, async (member) => {
   try {
     const userId = member.id;
@@ -86,30 +138,16 @@ client.on(Events.GuildMemberAdd, async (member) => {
       [userId]
     );
 
-    const welcomeEmbed = new EmbedBuilder()
-      .setTitle("🔒 Subscription Link Required")
-      .setDescription(`Welcome! You have **${timeLimit}** to link your subscription.\n\nType \`/link\` in the server to start.`)
+    const embed = new EmbedBuilder()
+      .setTitle("🔒 Link Required")
+      .setDescription(`Welcome! You have **${timeLimit}** to link your subscription.\n\nType \`/link\` to start.`)
       .setColor(isReturning ? "#FF0000" : "#FFA500");
 
-    await member.send({ embeds: [welcomeEmbed] }).catch(() => {});
+    await member.send({ embeds: [embed] }).catch(() => {});
   } catch (err) { console.error(err); }
 });
 
-// KICK LOOP
-async function checkDeadlines() {
-  try {
-    const guild = await client.guilds.fetch(process.env.DISCORD_GUILD_ID);
-    const expired = await pool.query("SELECT discord_id FROM users WHERE subscription_status = 'unlinked' AND link_deadline < now()");
-    for (const row of expired.rows) {
-      try {
-        const member = await guild.members.fetch(row.discord_id);
-        if (member && member.roles.cache.has(ROLES.UNLINKED)) await member.kick("Deadline expired.");
-      } catch (e) {}
-    }
-  } catch (err) { console.error(err); }
-}
-
-// LINK COMMAND WITH BOTH VARIABLE FORMATS
+// --- 5. LINK COMMAND ---
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand() || interaction.commandName !== "link") return;
   await interaction.deferReply({ ephemeral: true });
@@ -118,8 +156,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ 
-        discord_id: interaction.user.id, // snake_case
-        discordId: interaction.user.id   // camelCase
+        discord_id: interaction.user.id,
+        discordId: interaction.user.id 
       }),
     });
 
@@ -129,14 +167,21 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (finalLink) {
       await interaction.editReply({ content: `🔗 **Verify here:** ${finalLink}` });
     } else {
-      await interaction.editReply({ content: "❌ Backend error: Link missing from response." });
+      await interaction.editReply({ content: "❌ Backend error: Link missing." });
     }
   } catch (err) { await interaction.editReply({ content: "❌ Connection error." }); }
 });
 
-// ADMIN SYNC
+// --- 6. ADMIN COMMANDS ---
 client.on(Events.MessageCreate, async (message) => {
   if (!message.member?.permissions.has(PermissionFlagsBits.Administrator)) return;
+  
+  // New Command: Instantly force the promote/kick check
+  if (message.content === "!force-check") {
+    await message.reply("⏳ Running manual system check...");
+    await runSystemChecks(message.channel);
+  }
+
   if (message.content === "!sync-existing") {
     const members = await message.guild.members.fetch();
     let count = 0;
