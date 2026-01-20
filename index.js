@@ -93,10 +93,14 @@ async function checkDeadlines() {
       try {
         const member = await guild.members.fetch(row.discord_id);
         if (member && member.roles.cache.has(ROLES.UNLINKED)) {
-          await member.kick("Link deadline expired.");
-          console.log(`👞 Kicked ${member.user.tag}`);
+          // Double check they aren't 'active' now before kicking
+          const statusCheck = await pool.query("SELECT subscription_status FROM users WHERE discord_id = $1", [row.discord_id]);
+          if (statusCheck.rows[0]?.subscription_status !== 'active') {
+             await member.kick("Link deadline expired.");
+             console.log(`👞 Kicked ${member.user.tag}`);
+          }
         }
-      } catch (e) { /* Member likely already left or was kicked */ }
+      } catch (e) { /* Member likely already left */ }
     }
   } catch (err) { console.error("Kick loop error:", err); }
 }
@@ -105,18 +109,16 @@ async function checkDeadlines() {
 client.on(Events.MessageCreate, async (message) => {
   if (!message.member?.permissions.has(PermissionFlagsBits.Administrator)) return;
 
-  // BROADCAST ANNOUNCEMENT
   if (message.content === "!broadcast-link") {
     const embed = new EmbedBuilder()
       .setTitle("📢 Action Required: Link Your Subscription")
-      .setDescription("Please use the command **/link** to verify your account.\n\nNew members have **24 hours** to link.\nReturning members have **1 hour** to link.\n\nFailure to link will result in automatic removal.")
+      .setDescription("Please use the command **/link** to verify your account.\n\nNew members: **24 hours** to link.\nReturning members: **1 hour** to link.\n\nFailure to link will result in automatic removal.")
       .setColor("#FF0000")
       .setFooter({ text: "Type /link to start" });
     
     await message.channel.send({ embeds: [embed] });
   }
 
-  // SYNC EXISTING (For people already in the server)
   if (message.content === "!sync-existing") {
     const members = await message.guild.members.fetch();
     let count = 0;
@@ -129,17 +131,16 @@ client.on(Events.MessageCreate, async (message) => {
         count++;
       }
     }
-    message.reply(`✅ Synced ${count} users with fresh 24h timers.`);
+    message.reply(`✅ Synced ${count} users with 24h timers.`);
   }
 
-  // CLEAR DB
   if (message.content === "!clear-db") {
     await pool.query("DELETE FROM users");
     await message.reply("🗑️ Database wiped.");
   }
 });
 
-/* --- LINK COMMAND HANDLING --- */
+/* --- LINK COMMAND HANDLING (FIXED FOR UNDEFINED) --- */
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
@@ -151,11 +152,25 @@ client.on(Events.InteractionCreate, async (interaction) => {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ discord_id: interaction.user.id }),
       });
+
       const data = await response.json();
-      await interaction.editReply({ content: `🔗 **Verify here:** ${data.url}` });
+      console.log("📥 Backend Data Received:", data);
+
+      // Check multiple possible key names from the backend
+      const finalLink = data.url || data.link || data.verificationUrl;
+
+      if (finalLink) {
+        await interaction.editReply({ 
+          content: `🔗 **Verify here:** ${finalLink}\n\nEnter your Stripe email at the link above to secure your account.` 
+        });
+      } else {
+        await interaction.editReply({ 
+          content: "❌ Backend failed to provide a link. Check Railway logs for data structure." 
+        });
+      }
     } catch (err) {
-      console.error(err);
-      await interaction.editReply({ content: "❌ Backend connection error." });
+      console.error("Link Command Error:", err);
+      await interaction.editReply({ content: "❌ Connection error with verification server." });
     }
   }
 });
