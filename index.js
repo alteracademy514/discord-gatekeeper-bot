@@ -30,7 +30,7 @@ const client = new Client({
   ],
 });
 
-// --- 1. WEBHOOK (Still keeps it instant if backend connects) ---
+// --- 1. WEBHOOK (Instant Event Trigger) ---
 app.post("/update-role", async (req, res) => {
   const { discord_id, discordId, status } = req.body;
   const targetId = discord_id || discordId;
@@ -67,19 +67,18 @@ client.once(Events.ClientReady, async () => {
     );
     console.log("✅ Commands live.");
     
-    // 🔥 RUN CHECKS EVERY 30 SECONDS (Feels Instant)
+    // 🔥 RUN FULL SYSTEM CHECK EVERY 30 SECONDS
     setInterval(() => runSystemChecks(null), 30 * 1000);
     
   } catch (error) { console.error(error); }
 });
 
-// --- 3. THE DUAL-ACTION LOOP (Promote & Kick) ---
+// --- 3. THE TRI-ACTION LOOP (Promote, Demote, Kick) ---
 async function runSystemChecks(manualChannel = null) {
   try {
     const guild = await client.guilds.fetch(process.env.DISCORD_GUILD_ID);
     
-    // --- PART A: PROMOTE ACTIVE USERS ---
-    // Finds anyone in DB who is 'active' but still has 'Unlinked' role in Discord
+    // --- STEP A: PROMOTE (Active DB -> Active Role) ---
     const activeUsers = await pool.query("SELECT discord_id FROM users WHERE subscription_status = 'active'");
     let promoted = 0;
 
@@ -89,14 +88,36 @@ async function runSystemChecks(manualChannel = null) {
         if (member && member.roles.cache.has(ROLES.UNLINKED)) {
            await member.roles.add(ROLES.ACTIVE_MEMBER);
            await member.roles.remove(ROLES.UNLINKED);
-           console.log(`🔄 Auto-Promote: ${member.user.tag} is now Active.`);
+           console.log(`⬆️ Auto-Promote: ${member.user.tag} is now Active.`);
            promoted++;
         }
-      } catch (e) { /* Member left server or ID invalid */ }
+      } catch (e) {}
     }
 
-    // --- PART B: KICK EXPIRED USERS ---
-    // Finds anyone 'unlinked' whose time is up
+    // --- STEP B: DEMOTE (Unlinked DB -> Unlinked Role) ---
+    // If DB says unlinked, but they still have the Active role, strip it.
+    const unlinkedUsers = await pool.query("SELECT discord_id FROM users WHERE subscription_status = 'unlinked'");
+    let demoted = 0;
+
+    for (const row of unlinkedUsers.rows) {
+      try {
+        const member = await guild.members.fetch(row.discord_id);
+        // If they have the ACTIVE role, we must downgrade them
+        if (member && member.roles.cache.has(ROLES.ACTIVE_MEMBER)) {
+           await member.roles.remove(ROLES.ACTIVE_MEMBER);
+           await member.roles.add(ROLES.UNLINKED);
+           
+           console.log(`⬇️ Auto-Demote: ${member.user.tag} returned to Unlinked.`);
+           
+           // Optional: Send them a DM explaining why
+           await member.send("⚠️ **Status Update:** Your subscription is no longer active. You have been moved to the Unlinked role. Please use `/link` to restore access.").catch(() => {});
+           
+           demoted++;
+        }
+      } catch (e) {}
+    }
+
+    // --- STEP C: KICK (Unlinked + Expired -> Kick) ---
     const expiredUsers = await pool.query("SELECT discord_id FROM users WHERE subscription_status = 'unlinked' AND link_deadline < now()");
     let kicked = 0;
 
@@ -112,11 +133,11 @@ async function runSystemChecks(manualChannel = null) {
              console.error(`⚠️ Cannot kick ${member.user.tag} (Check Bot Hierarchy)`);
            }
         }
-      } catch (e) { /* Member likely already gone */ }
+      } catch (e) {}
     }
 
     if (manualChannel) {
-        manualChannel.send(`**System Check Complete:**\n✨ Promoted: ${promoted}\n👞 Kicked: ${kicked}`);
+        manualChannel.send(`**System Check Complete:**\n⬆️ Promoted: ${promoted}\n⬇️ Demoted: ${demoted}\n👞 Kicked: ${kicked}`);
     }
 
   } catch (err) { console.error("System Check Error:", err); }
@@ -176,7 +197,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
 client.on(Events.MessageCreate, async (message) => {
   if (!message.member?.permissions.has(PermissionFlagsBits.Administrator)) return;
   
-  // New Command: Instantly force the promote/kick check
   if (message.content === "!force-check") {
     await message.reply("⏳ Running manual system check...");
     await runSystemChecks(message.channel);
