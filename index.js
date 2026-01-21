@@ -16,7 +16,7 @@ const pool = new Pool({
 });
 
 const ROLES = {
-  UNLINKED: "1462833260567597272",      
+  UNLINKED: "1462833260567597272",       
   ACTIVE_MEMBER: "1462832923970633768" 
 };
 
@@ -30,7 +30,8 @@ const client = new Client({
   ],
 });
 
-// --- 1. WEBHOOK (Instant Event Trigger) ---
+// --- 1. WEBHOOK (Handle "Active" updates) ---
+// Note: Ensure your backend sets status='unlinked' in the DB if Stripe cancels!
 app.post("/update-role", async (req, res) => {
   const { discord_id, discordId, status } = req.body;
   const targetId = discord_id || discordId;
@@ -44,8 +45,7 @@ app.post("/update-role", async (req, res) => {
         await member.roles.add(ROLES.ACTIVE_MEMBER);
         await member.roles.remove(ROLES.UNLINKED);
         
-        // 2. [FIX] UPDATE THE DATABASE
-        // We must update the DB, otherwise the auto-checker will demote them 30s later
+        // 2. UPDATE THE DATABASE
         await pool.query(
             "UPDATE users SET subscription_status = 'active' WHERE discord_id = $1", 
             [targetId]
@@ -107,7 +107,7 @@ async function runSystemChecks(manualChannel = null) {
     }
 
     // --- STEP B: DEMOTE (Unlinked DB -> Unlinked Role) ---
-    // If DB says unlinked, but they still have the Active role, strip it.
+    // If DB says unlinked (e.g. Stripe cancelled), remove Active role
     const unlinkedUsers = await pool.query("SELECT discord_id FROM users WHERE subscription_status = 'unlinked'");
     let demoted = 0;
 
@@ -134,9 +134,7 @@ async function runSystemChecks(manualChannel = null) {
       try {
         const member = await guild.members.fetch(row.discord_id);
         
-        // [FIX] SAFETY CHECK: Do not kick if they joined less than 2 minutes ago.
-        // This prevents the "Race Condition" where the DB still has the old deadline
-        // before the GuildMemberAdd event has finished updating it.
+        // SAFETY CHECK: Do not kick if they joined less than 2 minutes ago
         if (member.joinedTimestamp && (Date.now() - member.joinedTimestamp < 120000)) {
             continue; 
         }
@@ -160,15 +158,34 @@ async function runSystemChecks(manualChannel = null) {
   } catch (err) { console.error("System Check Error:", err); }
 }
 
-// --- 4. NEW MEMBER HANDLING ---
+// --- 4. NEW MEMBER HANDLING (FIXED LOGIC) ---
 client.on(Events.GuildMemberAdd, async (member) => {
   try {
     const userId = member.id;
-    await member.roles.add(ROLES.UNLINKED);
+
+    // 🛑 CRITICAL FIX: Check DB before resetting status!
     const check = await pool.query("SELECT * FROM users WHERE discord_id = $1", [userId]);
-    const isReturning = check.rows.length > 0;
+    const userData = check.rows[0];
+
+    // SCENARIO 1: User is already ACTIVE in DB (Returning Subscriber)
+    if (userData && userData.subscription_status === 'active') {
+        console.log(`✅ Returning Active Member: ${member.user.tag} (Roles Restored)`);
+        await member.roles.add(ROLES.ACTIVE_MEMBER);
+        // Ensure they don't have unlinked role
+        if (member.roles.cache.has(ROLES.UNLINKED)) {
+            await member.roles.remove(ROLES.UNLINKED);
+        }
+        return; // EXIT HERE - Do not reset DB or send "Link Required" DM
+    }
+
+    // SCENARIO 2: User is New or Unlinked/Expired
+    await member.roles.add(ROLES.UNLINKED);
+    
+    // If they exist but are not active, they get 1 hour. If they are brand new, 24 hours.
+    const isReturning = !!userData; 
     const timeLimit = isReturning ? "1 hour" : "24 hours";
 
+    // Set them to unlinked and set the deadline
     await pool.query(
       `INSERT INTO users (discord_id, subscription_status, link_deadline) 
        VALUES ($1, 'unlinked', now() + interval '${timeLimit}') 
@@ -182,7 +199,8 @@ client.on(Events.GuildMemberAdd, async (member) => {
       .setColor(isReturning ? "#FF0000" : "#FFA500");
 
     await member.send({ embeds: [embed] }).catch(() => {});
-  } catch (err) { console.error(err); }
+    
+  } catch (err) { console.error("GuildMemberAdd Error:", err); }
 });
 
 // --- 5. LINK COMMAND ---
@@ -223,7 +241,9 @@ client.on(Events.MessageCreate, async (message) => {
     const members = await message.guild.members.fetch();
     let count = 0;
     for (const [id, m] of members) {
+      // Only sync members who don't have roles and aren't bots
       if (m.roles.cache.has(ROLES.UNLINKED) && !m.user.bot) {
+        // Use ON CONFLICT DO NOTHING to avoid overwriting existing Active users
         await pool.query("INSERT INTO users (discord_id, subscription_status, link_deadline) VALUES ($1, 'unlinked', now() + interval '24 hours') ON CONFLICT (discord_id) DO NOTHING", [id]);
         count++;
       }
