@@ -6,11 +6,13 @@ const {
 } = require("discord.js");
 const { Pool } = require("pg");
 
+// --- CONFIGURATION ---
 const ROLES = {
   UNLINKED: "1462833260567597272",       
   ACTIVE_MEMBER: "1462832923970633768" 
 };
 
+// --- SERVER SETUP ---
 const app = express();
 app.use(express.json());
 app.get("/", (req, res) => res.send("Bot is Online"));
@@ -41,6 +43,7 @@ app.post("/update-role", async (req, res) => {
       const member = await guild.members.fetch(targetId);
       
       if (status === 'active') {
+          // Upsert: Ensures we don't create duplicates
           const query = `
             INSERT INTO users (discord_id, subscription_status)
             VALUES ($1, 'active')
@@ -70,10 +73,11 @@ app.listen(process.env.PORT || 3000);
 client.once(Events.ClientReady, async () => {
   console.log(`🚀 Bot logged in as ${client.user.tag}`);
   
-  // Clean duplicates
+  // Clean duplicates on startup
   try {
       await pool.query(`DELETE FROM users a USING users b WHERE a.ctid < b.ctid AND a.discord_id = b.discord_id`);
-  } catch (e) {}
+      console.log("✅ Database duplicates cleaned.");
+  } catch (err) { console.error("DB Cleanup warning (safe to ignore if table empty):", err.message); }
 
   const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
   const commands = [
@@ -90,12 +94,13 @@ client.once(Events.ClientReady, async () => {
   } catch (error) { console.error(error); }
 });
 
-// --- 3. SYSTEM CHECKS ---
+// --- 3. SYSTEM CHECKS (PROTECTED LOGIC) ---
 async function runSystemChecks(manualChannel = null) {
   try {
     const guild = await client.guilds.fetch(process.env.DISCORD_GUILD_ID);
     
-    // 1. Get Active IDs
+    // 🛡️ SHIELD 1: Get the "Safe List" of Active IDs
+    // We check this list before doing anything dangerous.
     const activeQuery = await pool.query("SELECT discord_id FROM users WHERE subscription_status = 'active'");
     const activeIds = new Set(activeQuery.rows.map(r => r.discord_id));
 
@@ -118,12 +123,13 @@ async function runSystemChecks(manualChannel = null) {
     
     let demoted = 0;
     for (const row of unlinkedQuery.rows) {
+      // 🛡️ SHIELD 2: If user is in the "Safe List", skip them immediately.
       if (activeIds.has(row.discord_id)) continue; 
 
       try {
         const member = await guild.members.fetch(row.discord_id);
         
-        // 🛡️ ADMIN PROTECTION IN DEMOTE: Skip Admins
+        // 🛡️ SHIELD 3: Never demote Admins
         if (member.permissions.has(PermissionFlagsBits.Administrator)) continue;
 
         if (member && member.roles.cache.has(ROLES.ACTIVE_MEMBER)) {
@@ -137,24 +143,27 @@ async function runSystemChecks(manualChannel = null) {
     }
 
     // --- STEP C: KICK ---
+    // Only selects people who are NOT active
     const kickableUsers = await pool.query("SELECT discord_id FROM users WHERE subscription_status != 'active' AND link_deadline < now()");
     let kicked = 0;
 
     for (const row of kickableUsers.rows) {
+      // 🛡️ SHIELD 2: Double check they aren't on Safe List
       if (activeIds.has(row.discord_id)) continue;
 
       try {
         const member = await guild.members.fetch(row.discord_id);
         
-        // Safety 1: Don't kick new joins
+        // Safety: Don't kick brand new joins (< 2 mins)
         if (member.joinedTimestamp && (Date.now() - member.joinedTimestamp < 120000)) continue; 
 
-        // 🛡️ Safety 2: NEVER KICK ADMINS
+        // 🛡️ SHIELD 3: NEVER KICK ADMINS
         if (member.permissions.has(PermissionFlagsBits.Administrator)) {
-            console.log(`🛡️ Skipped Admin Kick: ${member.user.tag}`);
+            // console.log(`🛡️ Skipped Admin Kick: ${member.user.tag}`); // Uncomment to see when it protects an admin
             continue;
         }
 
+        // Only kick if they do NOT have the Active Role
         if (member && !member.roles.cache.has(ROLES.ACTIVE_MEMBER)) {
            if (member.kickable) {
              await member.kick("Link deadline expired.");
@@ -170,16 +179,16 @@ async function runSystemChecks(manualChannel = null) {
   } catch (err) { console.error("System Check Error:", err); }
 }
 
-// --- 4. REJOIN HANDLING ---
+// --- 4. REJOIN HANDLING (1 Hour Rule) ---
 client.on(Events.GuildMemberAdd, async (member) => {
   try {
     const userId = member.id;
     
-    // 1. Check DB
+    // 1. Check DB Status
     const check = await pool.query("SELECT * FROM users WHERE discord_id = $1", [userId]);
     const userData = check.rows[0];
 
-    // 2. IF ACTIVE: Restore
+    // 2. IF ACTIVE: Restore & Exit
     if (userData && userData.subscription_status === 'active') {
         console.log(`✅ Restoring Active Member: ${member.user.tag}`);
         await member.roles.add(ROLES.ACTIVE_MEMBER);
@@ -243,7 +252,7 @@ client.on(Events.MessageCreate, async (message) => {
     const members = await message.guild.members.fetch();
     let count = 0;
     for (const [id, m] of members) {
-      // 🛡️ SKIP ADMINS IN SYNC TOO
+      // 🛡️ SHIELD 3: Skip Admins in Sync
       if (m.permissions.has(PermissionFlagsBits.Administrator)) continue;
 
       if (m.roles.cache.has(ROLES.UNLINKED) && !m.user.bot) {
