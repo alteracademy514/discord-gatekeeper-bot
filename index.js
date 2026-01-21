@@ -16,7 +16,7 @@ const pool = new Pool({
 });
 
 const ROLES = {
-  UNLINKED: "1462833260567597272",     
+  UNLINKED: "1462833260567597272",      
   ACTIVE_MEMBER: "1462832923970633768" 
 };
 
@@ -34,18 +34,30 @@ const client = new Client({
 app.post("/update-role", async (req, res) => {
   const { discord_id, discordId, status } = req.body;
   const targetId = discord_id || discordId;
-  
+   
   if (status === 'active' && targetId) {
     try {
+      // 1. UPDATE DISCORD ROLES
       const guild = await client.guilds.fetch(process.env.DISCORD_GUILD_ID);
       const member = await guild.members.fetch(targetId);
       if (member) {
         await member.roles.add(ROLES.ACTIVE_MEMBER);
         await member.roles.remove(ROLES.UNLINKED);
+        
+        // 2. [FIX] UPDATE THE DATABASE
+        // We must update the DB, otherwise the auto-checker will demote them 30s later
+        await pool.query(
+            "UPDATE users SET subscription_status = 'active' WHERE discord_id = $1", 
+            [targetId]
+        );
+
         console.log(`⚡ Webhook: ${member.user.tag} upgraded to Active.`);
         return res.status(200).send({ message: "Updated" });
       }
-    } catch (err) { return res.status(500).send({ error: "Sync failed" }); }
+    } catch (err) { 
+        console.error("Webhook Error:", err);
+        return res.status(500).send({ error: "Sync failed" }); 
+    }
   }
   res.status(400).send({ message: "Invalid request" });
 });
@@ -102,14 +114,11 @@ async function runSystemChecks(manualChannel = null) {
     for (const row of unlinkedUsers.rows) {
       try {
         const member = await guild.members.fetch(row.discord_id);
-        // If they have the ACTIVE role, we must downgrade them
         if (member && member.roles.cache.has(ROLES.ACTIVE_MEMBER)) {
            await member.roles.remove(ROLES.ACTIVE_MEMBER);
            await member.roles.add(ROLES.UNLINKED);
            
            console.log(`⬇️ Auto-Demote: ${member.user.tag} returned to Unlinked.`);
-           
-           // Optional: Send them a DM explaining why
            await member.send("⚠️ **Status Update:** Your subscription is no longer active. You have been moved to the Unlinked role. Please use `/link` to restore access.").catch(() => {});
            
            demoted++;
@@ -124,6 +133,14 @@ async function runSystemChecks(manualChannel = null) {
     for (const row of expiredUsers.rows) {
       try {
         const member = await guild.members.fetch(row.discord_id);
+        
+        // [FIX] SAFETY CHECK: Do not kick if they joined less than 2 minutes ago.
+        // This prevents the "Race Condition" where the DB still has the old deadline
+        // before the GuildMemberAdd event has finished updating it.
+        if (member.joinedTimestamp && (Date.now() - member.joinedTimestamp < 120000)) {
+            continue; 
+        }
+
         if (member && member.roles.cache.has(ROLES.UNLINKED)) {
            if (member.kickable) {
              await member.kick("Link deadline expired.");
@@ -196,7 +213,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 // --- 6. ADMIN COMMANDS ---
 client.on(Events.MessageCreate, async (message) => {
   if (!message.member?.permissions.has(PermissionFlagsBits.Administrator)) return;
-  
+   
   if (message.content === "!force-check") {
     await message.reply("⏳ Running manual system check...");
     await runSystemChecks(message.channel);
