@@ -30,7 +30,7 @@ const client = new Client({
   ],
 });
 
-// --- 1. WEBHOOK (Instant Event Trigger) ---
+// --- 1. WEBHOOK ---
 app.post("/update-role", async (req, res) => {
   const { discord_id, discordId, status } = req.body;
   const targetId = discord_id || discordId;
@@ -41,14 +41,12 @@ app.post("/update-role", async (req, res) => {
       const member = await guild.members.fetch(targetId);
       
       if (status === 'active') {
-          // Upsert: If they exist, update to active. If new, insert active.
           const query = `
             INSERT INTO users (discord_id, subscription_status)
             VALUES ($1, 'active')
             ON CONFLICT (discord_id) 
             DO UPDATE SET subscription_status = 'active'
           `;
-          
           await pool.query(query, [targetId]);
 
           if (member) {
@@ -57,7 +55,6 @@ app.post("/update-role", async (req, res) => {
             console.log(`⚡ Webhook: ${member.user.tag} upgraded to Active.`);
           }
       } 
-      
       return res.status(200).send({ message: "Updated" });
     } catch (err) { 
         console.error("Webhook Error:", err);
@@ -69,18 +66,15 @@ app.post("/update-role", async (req, res) => {
 
 app.listen(process.env.PORT || 3000);
 
-// --- 2. STARTUP & CLEANUP ---
+// --- 2. STARTUP ---
 client.once(Events.ClientReady, async () => {
   console.log(`🚀 Bot logged in as ${client.user.tag}`);
   
-  // A. CLEAN DUPLICATE RECORDS
-  // This runs once on startup to fix the database if it has "ghost" rows
+  // Clean duplicates
   try {
       await pool.query(`DELETE FROM users a USING users b WHERE a.ctid < b.ctid AND a.discord_id = b.discord_id`);
-      console.log("✅ Database duplicates cleaned.");
-  } catch (err) { console.error("DB Cleanup warning:", err.message); }
+  } catch (e) {}
 
-  // B. REGISTER COMMANDS
   const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
   const commands = [
     new SlashCommandBuilder().setName("link").setDescription("Get your Stripe verification link").setDMPermission(true)
@@ -92,23 +86,17 @@ client.once(Events.ClientReady, async () => {
       { body: commands }
     );
     console.log("✅ Commands live.");
-    
-    // 🔥 RUN CHECKS EVERY 30 SECONDS
     setInterval(() => runSystemChecks(null), 30 * 1000);
-    
   } catch (error) { console.error(error); }
 });
 
-// --- 3. THE LOGIC LOOP (FIXED) ---
+// --- 3. SYSTEM CHECKS ---
 async function runSystemChecks(manualChannel = null) {
   try {
     const guild = await client.guilds.fetch(process.env.DISCORD_GUILD_ID);
     
-    // 1. GET LIST OF ACTIVE USERS
-    // We fetch this FIRST so we know exactly who is safe.
+    // 1. Get Active IDs
     const activeQuery = await pool.query("SELECT discord_id FROM users WHERE subscription_status = 'active'");
-    
-    // 🛡️ THE SAFETY SHIELD: Create a Set of IDs that are Active.
     const activeIds = new Set(activeQuery.rows.map(r => r.discord_id));
 
     // --- STEP A: PROMOTE ---
@@ -126,23 +114,23 @@ async function runSystemChecks(manualChannel = null) {
     }
 
     // --- STEP B: DEMOTE ---
-    // Select anyone who is 'unlinked' (or cancelled/expired)
     const unlinkedQuery = await pool.query("SELECT discord_id FROM users WHERE subscription_status = 'unlinked'");
     
     let demoted = 0;
     for (const row of unlinkedQuery.rows) {
-      // 🛑 CRITICAL FIX: If this user is in the 'activeIds' list, STOP.
-      // This means the DB has a duplicate row or a conflict. Active status WINS.
       if (activeIds.has(row.discord_id)) continue; 
 
       try {
         const member = await guild.members.fetch(row.discord_id);
-        // Only demote if they still have the Active role
+        
+        // 🛡️ ADMIN PROTECTION IN DEMOTE: Skip Admins
+        if (member.permissions.has(PermissionFlagsBits.Administrator)) continue;
+
         if (member && member.roles.cache.has(ROLES.ACTIVE_MEMBER)) {
            await member.roles.remove(ROLES.ACTIVE_MEMBER);
            await member.roles.add(ROLES.UNLINKED);
-           console.log(`⬇️ Auto-Demote: ${member.user.tag} (Status: Unlinked)`);
-           await member.send("⚠️ **Status Update:** Your subscription is no longer active. Please use `/link` to restore access.").catch(() => {});
+           console.log(`⬇️ Auto-Demote: ${member.user.tag}`);
+           await member.send("⚠️ **Status Update:** Your subscription is no longer active. Use `/link` to restore access.").catch(() => {});
            demoted++;
         }
       } catch (e) {}
@@ -153,16 +141,20 @@ async function runSystemChecks(manualChannel = null) {
     let kicked = 0;
 
     for (const row of kickableUsers.rows) {
-      // 🛑 CRITICAL FIX: Ignore if they are actually active
       if (activeIds.has(row.discord_id)) continue;
 
       try {
         const member = await guild.members.fetch(row.discord_id);
         
-        // Safety: Don't kick people who joined less than 2 minutes ago
+        // Safety 1: Don't kick new joins
         if (member.joinedTimestamp && (Date.now() - member.joinedTimestamp < 120000)) continue; 
 
-        // Only kick if they don't have the active role
+        // 🛡️ Safety 2: NEVER KICK ADMINS
+        if (member.permissions.has(PermissionFlagsBits.Administrator)) {
+            console.log(`🛡️ Skipped Admin Kick: ${member.user.tag}`);
+            continue;
+        }
+
         if (member && !member.roles.cache.has(ROLES.ACTIVE_MEMBER)) {
            if (member.kickable) {
              await member.kick("Link deadline expired.");
@@ -183,11 +175,11 @@ client.on(Events.GuildMemberAdd, async (member) => {
   try {
     const userId = member.id;
     
-    // 1. Check DB Status
+    // 1. Check DB
     const check = await pool.query("SELECT * FROM users WHERE discord_id = $1", [userId]);
     const userData = check.rows[0];
 
-    // 2. IF ACTIVE: Restore Role & Exit
+    // 2. IF ACTIVE: Restore
     if (userData && userData.subscription_status === 'active') {
         console.log(`✅ Restoring Active Member: ${member.user.tag}`);
         await member.roles.add(ROLES.ACTIVE_MEMBER);
@@ -195,11 +187,9 @@ client.on(Events.GuildMemberAdd, async (member) => {
         return; 
     }
 
-    // 3. IF NOT ACTIVE (Rejoin or New): 
-    // Give them exactly 1 hour from NOW.
+    // 3. IF NOT ACTIVE (Rejoin or New): 1 Hour Deadline
     await member.roles.add(ROLES.UNLINKED);
     
-    // Updates existing row or inserts new one
     await pool.query(
       `INSERT INTO users (discord_id, subscription_status, link_deadline) 
        VALUES ($1, 'unlinked', now() + interval '1 hour') 
@@ -215,7 +205,7 @@ client.on(Events.GuildMemberAdd, async (member) => {
       .setColor("#FFA500");
 
     await member.send({ embeds: [embed] }).catch(() => {});
-  } catch (err) { console.error(err); }
+  } catch (err) { console.error("GuildMemberAdd Error:", err); }
 });
 
 // --- 5. LINK COMMAND ---
@@ -253,6 +243,9 @@ client.on(Events.MessageCreate, async (message) => {
     const members = await message.guild.members.fetch();
     let count = 0;
     for (const [id, m] of members) {
+      // 🛡️ SKIP ADMINS IN SYNC TOO
+      if (m.permissions.has(PermissionFlagsBits.Administrator)) continue;
+
       if (m.roles.cache.has(ROLES.UNLINKED) && !m.user.bot) {
         await pool.query("INSERT INTO users (discord_id, subscription_status, link_deadline) VALUES ($1, 'unlinked', now() + interval '24 hours') ON CONFLICT (discord_id) DO NOTHING", [id]);
         count++;
